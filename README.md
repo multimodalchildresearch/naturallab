@@ -13,17 +13,6 @@ A comprehensive, open-source system for automated tracking and behavioral analys
 - **Multi-Sensor Synchronization**: LSL-based acquisition with millisecond precision across cameras, eye trackers, and more
 - **Modular Design**: Use individual components or the complete pipeline
 
-## 🌐 Applications
-
-| Domain | Use Cases |
-|--------|-----------|
-| **Research** | Behavioral observation, developmental studies, interaction analysis |
-| **Retail** | Customer flow, dwell time, path optimization |
-| **Sports** | Player tracking, formation analysis, distance metrics |
-| **Healthcare** | Patient mobility, fall detection, rehabilitation |
-| **Security** | Occupancy monitoring, crowd analysis |
-| **Manufacturing** | Quality control, inventory tracking |
-
 ## 📋 System Requirements
 
 - **Python**: 3.8 or higher
@@ -274,20 +263,6 @@ create_prototypes(
     image_dir="reference_images/",
     output_path="prototypes.h5"
 )
-```
-
-## 📚 Citation
-
-If you use this system in your research, please cite:
-
-```bibtex
-@article{anonymous2026naturallab,
-  title={NaturalLab: An Open-Source Multi-Modal System for Automated 
-         Behavioral Analysis in Naturalistic Developmental Research},
-  author={Anonymous},
-  journal={Behavior Research Methods},
-  year={2026}
-}
 ```
 
 ## 🤝 Contributing

@@ -22,16 +22,6 @@ python scripts/track_people_in_video.py \
     --output results/
 ```
 
-### Applications
-
-| Domain | Use Case |
-|--------|----------|
-| **Retail** | Customer flow analysis, dwell time, path optimization |
-| **Sports** | Player tracking, formation analysis, distance covered |
-| **Security** | Occupancy monitoring, crowd analysis |
-| **Healthcare** | Patient mobility assessment, fall detection |
-| **Research** | Behavioral observation, interaction analysis |
-
 ### Output Files
 
 - `tracks.csv` - Frame-by-frame position data
@@ -106,16 +96,6 @@ python scripts/detect_custom_objects.py detect \
     --prototypes prototypes.h5 \
     --output detections/
 ```
-
-### Applications
-
-| Domain | Use Case |
-|--------|----------|
-| **Inventory** | Product counting, shelf monitoring |
-| **Quality Control** | Defect detection, part verification |
-| **Wildlife** | Species identification, animal counting |
-| **Research** | Experimental object tracking |
-| **Art/Cultural** | Artifact identification, style matching |
 
 ### How It Works
 
