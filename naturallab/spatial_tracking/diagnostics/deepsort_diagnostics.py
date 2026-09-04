@@ -1,14 +1,14 @@
 import cv2
 import numpy as np
-import os
 import time
 import logging
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 class DeepSORTDiagnostics:
     """Diagnostic tools for debugging DeepSORT tracking"""
     
-    def __init__(self, feature_extractor=None, feature_gallery=None, output_dir="deepsort_diagnostics"):
+    def __init__(self, feature_extractor=None, feature_gallery=None, *, output_dir):
         """
         Initialize diagnostics
         
@@ -22,27 +22,36 @@ class DeepSORTDiagnostics:
         )
         self.feature_extractor = feature_extractor
         self.feature_gallery = feature_gallery
-        self.output_dir = output_dir
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "features"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "gallery"), exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "frames"), exist_ok=True)
-        
-        # Create log file
-        log_path = os.path.join(output_dir, "deepsort_log.txt")
-        if os.path.exists(log_path):
-            # Append timestamp to create a new log file
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            log_path = os.path.join(output_dir, f"deepsort_log_{timestamp}.txt")
-            
-        self.log_file = log_path
-        with open(self.log_file, 'w') as f:
+        self.output_dir = Path(output_dir).expanduser()
+        if self.output_dir.is_symlink():
+            raise ValueError(
+                f"refusing symlink diagnostics directory: {self.output_dir}"
+            )
+        if self.output_dir.exists() and not self.output_dir.is_dir():
+            raise ValueError(
+                "diagnostics output path is not a directory: "
+                f"{self.output_dir}"
+            )
+        if self.output_dir.exists() and any(self.output_dir.iterdir()):
+            raise FileExistsError(
+                "diagnostics output directory is not empty; choose a new "
+                f"run directory: {self.output_dir}"
+            )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_file = self.output_dir / "deepsort_log.txt"
+        with self.log_file.open("w", encoding="utf-8") as f:
             f.write("DeepSORT Tracking Log\n")
             f.write("====================\n\n")
-            
-        self.log(f"Diagnostics initialized, saving to {output_dir}")
+        self.provenance = {
+            "enabled": True,
+            "path_policy": "explicit_new_or_empty_directory_required",
+            "output_directory_name": self.output_dir.name,
+            "persisted_content": "text_log_only",
+            "persists_images": False,
+        }
+
+        self.log("Diagnostics initialized; participant images are not saved")
     
     def log(self, message: str) -> None:
         """Log a message to the log file and console"""
@@ -51,7 +60,7 @@ class DeepSORTDiagnostics:
         
         # Write to log file
         try:
-            with open(self.log_file, 'a') as f:
+            with self.log_file.open("a", encoding="utf-8") as f:
                 f.write(f"{log_message}\n")
         except Exception as e:
             print(f"Error writing to log file: {e}")
@@ -82,15 +91,8 @@ class DeepSORTDiagnostics:
         if crop is None or features is None:
             return
             
-        # Save the crop image
-        crop_path = os.path.join(self.output_dir, "features", 
-                               f"track_{track_id[:6]}_frame_{frame_idx}.jpg")
-        try:
-            cv2.imwrite(crop_path, crop)
-        except Exception as e:
-            self.log(f"Error saving crop: {e}")
-        
-        # Log feature information
+        # Deliberately log only numeric summaries; participant crops are never
+        # persisted by the public diagnostics API.
         feature_dim = features.shape[0] if features is not None else 0
         feature_min = np.min(features) if features is not None else 0
         feature_max = np.max(features) if features is not None else 0
@@ -235,13 +237,5 @@ class DeepSORTDiagnostics:
         cv2.putText(diagnostic_frame, f"Active: {len(active_tracks)}, Lost: {len(lost_tracks)}", 
                   (10, 60), 
                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        
-        # Save frame every 30 frames
-        if frame_idx % 30 == 0:
-            try:
-                frame_path = os.path.join(self.output_dir, "frames", f"frame_{frame_idx}.jpg")
-                cv2.imwrite(frame_path, diagnostic_frame)
-            except Exception as e:
-                self.log(f"Error saving diagnostic frame: {e}")
         
         return diagnostic_frame

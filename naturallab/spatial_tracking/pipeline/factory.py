@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import os
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 import warnings
 
 from naturallab.spatial_tracking.base import TrackerModule
@@ -44,6 +44,53 @@ class PipelineDependencyError(RuntimeError):
     """Raised when a selected pipeline backend cannot be constructed."""
 
 
+def _normalize_role_descriptions(
+    value: Optional[Mapping[str, str]],
+) -> Optional[dict[str, str]]:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not value:
+        raise PipelineConfigError(
+            "role_descriptions must be a non-empty mapping when role "
+            "assignment is requested"
+        )
+    normalized: dict[str, str] = {}
+    for raw_role, raw_description in value.items():
+        if not isinstance(raw_role, str) or not raw_role.strip():
+            raise PipelineConfigError(
+                "every role_descriptions key must be non-empty text"
+            )
+        if (
+            not isinstance(raw_description, str)
+            or not raw_description.strip()
+        ):
+            raise PipelineConfigError(
+                "every role description must be non-empty text"
+            )
+        role = raw_role.strip()
+        if role in normalized:
+            raise PipelineConfigError(
+                f"duplicate normalized role description: {role}"
+            )
+        normalized[role] = raw_description.strip()
+    return normalized
+
+
+def _add_role_provenance(
+    value: dict[str, Any],
+    role_assigner: Optional[QwenTrackRoleAssigner],
+) -> None:
+    value["role_assignment_enabled"] = role_assigner is not None
+    value["roles"] = (
+        list(role_assigner.roles) if role_assigner is not None else []
+    )
+    value["role_descriptions"] = (
+        dict(role_assigner.role_descriptions)
+        if role_assigner is not None
+        else {}
+    )
+
+
 @dataclass(frozen=True)
 class SpatialPipelineComponents:
     """Constructed runtime components plus their validated source preset."""
@@ -52,10 +99,11 @@ class SpatialPipelineComponents:
     pipeline: TrackerPipeline
     detector: QwenDetectorModule
     tracker: TrackerModule
-    role_assigner: QwenTrackRoleAssigner
+    role_assigner: Optional[QwenTrackRoleAssigner]
     qwen_config: QwenBackendConfig
     reid_model_path: Path
     reid_checkpoint: ReIDCheckpointResolution
+    diagnostics_provenance: dict[str, Any]
 
     def provenance(self) -> dict[str, Any]:
         """Return configured runtime identity without an API key."""
@@ -72,6 +120,8 @@ class SpatialPipelineComponents:
         value["reid_model"] = self.reid_checkpoint.provenance(
             self.preset.tracker.reid_model
         )
+        value["diagnostics"] = dict(self.diagnostics_provenance)
+        _add_role_provenance(value, self.role_assigner)
         return value
 
 
@@ -127,12 +177,15 @@ def _build_tracker(
     feature_gallery: Optional[Any],
     reid_model_path: Path,
     allow_reid_fallback: bool,
+    diagnostics_output_dir: Optional[str | os.PathLike[str]],
 ) -> TrackerModule:
     tracker_factory = deep_sort_factory or _default_deepsort_factory()
     kwargs = preset.tracker.constructor_kwargs(
         allow_reid_fallback=allow_reid_fallback,
     )
     kwargs["reid_model_path"] = str(reid_model_path)
+    if diagnostics_output_dir is not None:
+        kwargs["diagnostics_output_dir"] = diagnostics_output_dir
     if feature_extractor is not None:
         kwargs["feature_extractor"] = feature_extractor
     if feature_gallery is not None:
@@ -166,13 +219,19 @@ def build_spatial_pipeline(
     feature_gallery: Optional[Any] = None,
     allow_reid_fallback: Optional[bool] = None,
     reid_download_opener: Optional[Callable[..., Any]] = None,
+    role_descriptions: Optional[Mapping[str, str]] = None,
+    diagnostics_output_dir: Optional[str | os.PathLike[str]] = None,
 ) -> SpatialPipelineComponents:
-    """Build Qwen detection, DeepSORT tracking, and Qwen role assignment.
+    """Build Qwen detection and DeepSORT, with optional role assignment.
 
     Runtime services and DeepSORT feature models are injectable so callers can
     test construction without network calls. The pinned ReID checkpoint is
     downloaded and verified when absent. Histogram fallback is disabled unless
     the caller explicitly sets ``allow_reid_fallback=True`` for this run.
+    Role assignment is constructed only when the caller supplies a non-empty
+    mapping from arbitrary role names to descriptions.
+    Diagnostics remain disabled unless the selected preset enables them and
+    the caller supplies a dedicated output directory.
     """
 
     if preset is not None and preset_name != DEFAULT_SPATIAL_PRESET:
@@ -181,6 +240,17 @@ def build_spatial_pipeline(
         )
     selected = preset or load_spatial_pipeline_preset(preset_name)
     validate_spatial_pipeline_preset(selected)
+    if selected.tracker.enable_diagnostics and diagnostics_output_dir is None:
+        raise PipelineConfigError(
+            "enable_diagnostics requires an explicit diagnostics_output_dir"
+        )
+    if not selected.tracker.enable_diagnostics and diagnostics_output_dir is not None:
+        raise PipelineConfigError(
+            "diagnostics_output_dir requires enable_diagnostics: true"
+        )
+    normalized_role_descriptions = _normalize_role_descriptions(
+        role_descriptions
+    )
     if allow_reid_fallback is not None and not isinstance(
         allow_reid_fallback,
         bool,
@@ -262,12 +332,21 @@ def build_spatial_pipeline(
         feature_gallery=feature_gallery,
         reid_model_path=resolved_reid_model_path,
         allow_reid_fallback=effective_allow_reid_fallback,
+        diagnostics_output_dir=diagnostics_output_dir,
     )
     actual_reid_backend = getattr(
         tracker,
         "reid_backend",
         selected.tracker.reid_model.architecture,
     )
+    if (
+        actual_reid_backend == "histogram"
+        and not effective_allow_reid_fallback
+    ):
+        raise PipelineDependencyError(
+            "DeepSORT initialized a histogram ReID backend even though "
+            "allow_reid_fallback was not enabled"
+        )
     if actual_reid_backend == "histogram" and not checkpoint.fallback_used:
         checkpoint = replace(
             checkpoint,
@@ -279,16 +358,39 @@ def build_spatial_pipeline(
                 "model-load-failed",
             ),
         )
-    role_assigner = QwenTrackRoleAssigner(
-        roles=selected.role_assignment.roles,
-        role_descriptions=(
-            selected.role_assignment.role_description_mapping()
-        ),
-        evidence_images_per_track=(
-            selected.role_assignment.evidence_images_per_track
-        ),
-        config=qwen_config,
-        transport=transport,
+    role_assigner = None
+    if normalized_role_descriptions is not None:
+        role_assigner = QwenTrackRoleAssigner(
+            roles=tuple(normalized_role_descriptions),
+            role_descriptions=normalized_role_descriptions,
+            evidence_images_per_track=(
+                selected.role_assignment.evidence_images_per_track
+            ),
+            config=qwen_config,
+            transport=transport,
+        )
+    diagnostics_provenance = dict(
+        getattr(
+            tracker,
+            "diagnostics_provenance",
+            {
+                "enabled": selected.tracker.enable_diagnostics,
+                "path_policy": (
+                    "explicit_new_or_empty_directory_required"
+                ),
+                "output_directory_name": (
+                    Path(diagnostics_output_dir).expanduser().name
+                    if diagnostics_output_dir is not None
+                    else None
+                ),
+                "persisted_content": (
+                    "text_log_only"
+                    if selected.tracker.enable_diagnostics
+                    else "none"
+                ),
+                "persists_images": False,
+            },
+        )
     )
     pipeline_provenance = selected.provenance()
     tracker_parameters = dict(
@@ -307,9 +409,11 @@ def build_spatial_pipeline(
     pipeline_provenance["reid_model"] = checkpoint.provenance(
         selected.tracker.reid_model
     )
+    pipeline_provenance["diagnostics"] = diagnostics_provenance
     pipeline_provenance["endpoint_identity"] = (
         qwen_config.endpoint_identity
     )
+    _add_role_provenance(pipeline_provenance, role_assigner)
     pipeline = TrackerPipeline(
         [detector, tracker],
         provenance=pipeline_provenance,
@@ -323,4 +427,5 @@ def build_spatial_pipeline(
         qwen_config=qwen_config,
         reid_model_path=resolved_reid_model_path,
         reid_checkpoint=checkpoint,
+        diagnostics_provenance=diagnostics_provenance,
     )

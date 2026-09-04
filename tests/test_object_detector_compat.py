@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from pathlib import Path
+import sys
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -14,10 +16,14 @@ from scripts.detect_custom_objects import (
     VIDEO_DETECTION_COLUMNS,
     annotated_image_filename,
     classify_detection_input,
+    create_prototypes,
+    detect_objects,
     discover_media_files,
     draw_detection_preview,
     parse_category_queries,
+    process_video,
     require_empty_output_directory,
+    write_prototypes_atomically,
     write_detection_tables,
 )
 
@@ -163,3 +169,241 @@ def test_zero_detection_tables_keep_stable_headers(tmp_path) -> None:
 def test_category_queries_reject_an_empty_mapping() -> None:
     with pytest.raises(ValueError, match="non-empty list"):
         parse_category_queries("{}")
+
+
+def test_prototype_creation_fails_if_any_reference_image_is_bad(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    category = tmp_path / "references" / "component"
+    category.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "white").save(category / "01-valid.png")
+    (category / "02-broken.jpg").write_bytes(b"not an image")
+    output = tmp_path / "prototypes.h5"
+    output.write_bytes(b"previous complete prototype")
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+        def get_image_features(self, **_inputs):
+            return torch.ones((1, 4))
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(_model_name):
+            return FakeModel()
+
+    class FakeProcessor:
+        def __call__(self, _image, *, return_tensors):
+            assert return_tensors == "pt"
+            return {"pixel_values": torch.ones((1, 3, 8, 8))}
+
+    class FakeAutoImageProcessor:
+        @staticmethod
+        def from_pretrained(_model_name):
+            return FakeProcessor()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoModel=FakeAutoModel,
+            AutoImageProcessor=FakeAutoImageProcessor,
+        ),
+    )
+
+    result = create_prototypes(
+        SimpleNamespace(
+            images=str(tmp_path / "references"),
+            output=str(output),
+            model="test-model",
+            device="cpu",
+        )
+    )
+
+    assert result == 1
+    assert output.read_bytes() == b"previous complete prototype"
+
+
+def test_atomic_prototype_write_preserves_previous_file_on_failure(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "prototypes.h5"
+    output.write_bytes(b"previous complete prototype")
+
+    class BrokenFile:
+        attrs = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def create_dataset(self, _name, *, data):
+            assert data is not None
+            raise RuntimeError("simulated HDF5 write failure")
+
+        def flush(self):
+            return None
+
+    broken_h5py = SimpleNamespace(File=lambda *_args, **_kwargs: BrokenFile())
+
+    with pytest.raises(RuntimeError, match="simulated HDF5"):
+        write_prototypes_atomically(
+            output,
+            {"component": np.ones(4)},
+            "test-model",
+            broken_h5py,
+        )
+
+    assert output.read_bytes() == b"previous complete prototype"
+    assert not list(tmp_path.glob(".prototypes.h5.*.tmp"))
+
+
+def test_video_detection_rejects_truncated_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+
+    import naturallab.media
+    import scripts.detect_custom_objects as detector_script
+
+    class ProbeCapture:
+        def __init__(self, _path):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return 4.0
+            if property_id == cv2.CAP_PROP_FPS:
+                return 25.0
+            raise AssertionError(f"unexpected property: {property_id}")
+
+        def read(self):
+            return True, np.zeros((8, 8, 3), dtype=np.uint8)
+
+        def release(self):
+            return None
+
+    class TruncatedSource:
+        def __init__(self, _path, *, step):
+            assert step == 2
+
+        def __iter__(self):
+            yield SimpleNamespace(
+                frame_index=0,
+                image=np.zeros((8, 8, 3), dtype=np.uint8),
+                source_timestamp=0.0,
+                timestamp_ns=0,
+                metadata={"timestamp_source": "test"},
+            )
+
+    monkeypatch.setattr(cv2, "VideoCapture", ProbeCapture)
+    monkeypatch.setattr(naturallab.media, "VideoFileSource", TruncatedSource)
+    monkeypatch.setattr(detector_script, "process_image", lambda *_args: [])
+    video_path = tmp_path / "truncated.mp4"
+    video_path.write_bytes(b"fixture")
+    output_path = tmp_path / "results"
+    output_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="1 of 2 requested sampled frames"):
+        process_video(
+            video_path,
+            output_path,
+            object(),
+            object(),
+            object(),
+            object(),
+            ["component"],
+            ["object"],
+            SimpleNamespace(
+                frame_skip=2,
+                save_frames=False,
+                frame_interval=100,
+            ),
+        )
+
+    assert not (output_path / "detections.csv").exists()
+
+
+def test_failed_video_detection_does_not_publish_staged_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import h5py
+
+    from naturallab.gaze_analysis.object_detection import owlv2 as owl_module
+    import scripts.detect_custom_objects as detector_script
+
+    prototype_path = tmp_path / "prototypes.h5"
+    with h5py.File(prototype_path, "w") as prototype_file:
+        prototype_file.create_dataset("component", data=np.ones(4))
+        prototype_file.attrs["model"] = "test-model"
+    video_path = tmp_path / "truncated.mp4"
+    video_path.write_bytes(b"fixture")
+    output_path = tmp_path / "detection-run"
+
+    class FakeModel:
+        def eval(self):
+            return self
+
+        def to(self, _device):
+            return self
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(_model_name):
+            return FakeModel()
+
+    class FakeAutoImageProcessor:
+        @staticmethod
+        def from_pretrained(_model_name):
+            return object()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(
+            AutoModel=FakeAutoModel,
+            AutoImageProcessor=FakeAutoImageProcessor,
+        ),
+    )
+    monkeypatch.setattr(
+        owl_module,
+        "OWLv2Detector",
+        lambda **_kwargs: object(),
+    )
+
+    def fail_after_partial_write(_input, staging_path, *_args):
+        (staging_path / "partial.jpg").write_bytes(b"partial")
+        raise RuntimeError("truncated decode")
+
+    monkeypatch.setattr(detector_script, "process_video", fail_after_partial_write)
+
+    result = detect_objects(
+        SimpleNamespace(
+            input=str(video_path),
+            prototypes=str(prototype_path),
+            output=str(output_path),
+            categories=None,
+            threshold=0.1,
+            match_threshold=0.3,
+            frame_skip=1,
+            save_frames=True,
+            frame_interval=1,
+            device="cpu",
+        )
+    )
+
+    assert result == 1
+    assert not output_path.exists()
+    assert not list(tmp_path.glob(".detection-run.staging-*"))

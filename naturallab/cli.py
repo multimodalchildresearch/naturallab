@@ -15,12 +15,18 @@ from naturallab.spatial_tracking.calibration.commands import (
     run_calibration_command,
 )
 from naturallab.workflows import (
+    FailureRecord,
     ManifestError,
     RunState,
     RunStateError,
     StepStatus,
     StudyManifest,
     load_manifest,
+)
+from naturallab.workflows.privacy import (
+    portable_path_identity,
+    sanitize_error_message,
+    sanitize_error_type,
 )
 
 
@@ -47,7 +53,10 @@ def _validation_report(manifest: StudyManifest) -> Dict[str, Any]:
     selected = [step.name for step in manifest.selected_steps()]
     return {
         "valid": True,
-        "manifest": str(manifest.source_path),
+        "manifest": portable_path_identity(
+            manifest.source_path or "manifest",
+            base_dir=manifest.base_dir,
+        ),
         "schema_version": manifest.schema_version,
         "study_id": manifest.study_id,
         "session_id": manifest.session_id,
@@ -63,16 +72,34 @@ def _validation_report(manifest: StudyManifest) -> Dict[str, Any]:
 
 def _plan_report(manifest: StudyManifest) -> Dict[str, Any]:
     return {
-        "manifest": str(manifest.source_path),
+        "manifest": portable_path_identity(
+            manifest.source_path or "manifest",
+            base_dir=manifest.base_dir,
+        ),
         "study_id": manifest.study_id,
         "session_id": manifest.session_id,
-        "state_path": str(_default_state_path(manifest)),
+        "state_path": portable_path_identity(
+            _default_state_path(manifest),
+            base_dir=manifest.base_dir,
+        ),
         "selected_steps": [
             {
                 "name": step.name,
                 "depends_on": list(step.depends_on),
-                "inputs": list(step.inputs),
-                "outputs": list(step.outputs),
+                "inputs": [
+                    portable_path_identity(
+                        path,
+                        base_dir=manifest.base_dir,
+                    )
+                    for path in step.inputs
+                ],
+                "outputs": [
+                    portable_path_identity(
+                        path,
+                        base_dir=manifest.base_dir,
+                    )
+                    for path in step.outputs
+                ],
                 "config_fingerprint": (
                     manifest.step_config_fingerprint(step.name)
                 ),
@@ -104,6 +131,11 @@ def _status_report(
     steps: list[Dict[str, Any]] = []
     for name, step in manifest.steps.items():
         persisted = None if state is None else state.steps.get(name)
+        error_record = (
+            None
+            if persisted is None
+            else FailureRecord.from_value(persisted.error)
+        )
         default_status = (
             StepStatus.PENDING if step.selected else StepStatus.SKIPPED
         )
@@ -123,7 +155,11 @@ def _status_report(
                 "completed_at": (
                     None if persisted is None else persisted.completed_at
                 ),
-                "error": None if persisted is None else persisted.error,
+                "error": (
+                    None
+                    if error_record is None
+                    else error_record.to_dict()
+                ),
             }
         )
 
@@ -133,10 +169,16 @@ def _status_report(
         counts[status_name] += 1
 
     return {
-        "manifest": str(manifest.source_path),
+        "manifest": portable_path_identity(
+            manifest.source_path or "manifest",
+            base_dir=manifest.base_dir,
+        ),
         "study_id": manifest.study_id,
         "session_id": manifest.session_id,
-        "state_path": str(state_path),
+        "state_path": portable_path_identity(
+            state_path,
+            base_dir=manifest.base_dir,
+        ),
         "state_exists": state_exists,
         "manifest_fingerprint_matches": (
             None
@@ -223,7 +265,10 @@ def _format_status(report: Dict[str, Any]) -> str:
         )
         lines.append(f"  {step['name']}: {step['status']}{attempts}")
         if step["error"]:
-            lines.append(f"    error: {step['error']}")
+            lines.append(
+                "    error: "
+                f"{step['error']['type']}: {step['error']['message']}"
+            )
     if report["unexpected_state_steps"]:
         lines.append(
             "State-only steps: "
@@ -376,7 +421,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 return 2
         except (ManifestError, RunStateError) as exc:
-            print(f"naturallab: error: {exc}", file=sys.stderr)
+            error_type = sanitize_error_type(type(exc).__name__)
+            error_message = sanitize_error_message(exc)
+            print(
+                f"naturallab: error [{error_type}]: {error_message}",
+                file=sys.stderr,
+            )
             return 2
 
         if args.json_output:

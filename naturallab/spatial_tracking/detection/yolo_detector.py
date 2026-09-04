@@ -4,11 +4,11 @@ from typing import Dict, Any
 from naturallab.spatial_tracking.base import TrackerModule
 
 class YOLODetectorModule(TrackerModule):
-    """Person detection module using YOLOv8"""
+    """Person detection module using Ultralytics YOLO."""
     
     def __init__(
         self,
-        model_path: str = 'yolov8n.pt',
+        model_path: str = 'yolo11n.pt',
         confidence: float = 0.25,
         device: str = None,
     ):
@@ -16,7 +16,7 @@ class YOLODetectorModule(TrackerModule):
         Initialize the YOLOv8 detector
         
         Args:
-            model_path: Path to the YOLOv8 model file (can also be 'yolov8n.pt', 'yolov8s.pt', etc.)
+            model_path: Path or Ultralytics name for a YOLO model.
             confidence: Confidence threshold for detections
             device: Inference device understood by Ultralytics, such as
                 ``cpu``, ``cuda``, or ``None`` for automatic selection.
@@ -28,7 +28,10 @@ class YOLODetectorModule(TrackerModule):
             from ultralytics import YOLO
             self.model = YOLO(model_path)
         except ImportError:
-            self.log_error("Failed to import ultralytics. Install with: pip install ultralytics")
+            self.log_error(
+                "Failed to import ultralytics. Install NaturalLab with its "
+                "'yolo' extra and review THIRD_PARTY_NOTICES.md first."
+            )
             raise
         except Exception as e:
             self.log_error(f"Failed to load YOLO model from {model_path}: {e}")

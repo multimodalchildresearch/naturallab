@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -12,8 +13,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
+from .privacy import sanitize_error_message, sanitize_error_type
+
 
 RUN_STATE_SCHEMA_VERSION = "1.0"
+_SAFE_FINGERPRINT_KEY_RE = re.compile(
+    r"^(?:dependency|output|step|view)\.[A-Za-z0-9._-]+$"
+)
 
 
 class RunStateError(RuntimeError):
@@ -127,6 +133,62 @@ def fingerprint_path(path: Path | str) -> str:
 
 
 @dataclass
+class FailureRecord:
+    """Bounded, path-free diagnostic persisted for one failed step."""
+
+    type: str
+    message: str
+
+    @classmethod
+    def from_exception(cls, exc: BaseException) -> "FailureRecord":
+        return cls(
+            type=sanitize_error_type(type(exc).__name__),
+            message=sanitize_error_message(exc),
+        )
+
+    @classmethod
+    def from_value(cls, value: Any) -> Optional["FailureRecord"]:
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return cls(
+                type=sanitize_error_type(value.type),
+                message=sanitize_error_message(value.message),
+            )
+        if isinstance(value, str):
+            # Read legacy pre-release state defensively and sanitize it before
+            # it can be displayed or written again.
+            return cls(
+                type="Error",
+                message=sanitize_error_message(value),
+            )
+        if not isinstance(value, Mapping):
+            raise RunStateError("step error must be a mapping or null")
+        unknown = sorted(set(value) - {"type", "message"})
+        if unknown:
+            raise RunStateError(
+                "step error contains unknown field(s): "
+                + ", ".join(str(item) for item in unknown)
+            )
+        if not isinstance(value.get("type"), str) or not isinstance(
+            value.get("message"), str
+        ):
+            raise RunStateError(
+                "step error type and message must be strings"
+            )
+        return cls(
+            type=sanitize_error_type(value["type"]),
+            message=sanitize_error_message(value["message"]),
+        )
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "type": sanitize_error_type(self.type),
+            "message": sanitize_error_message(self.message),
+        }
+
+
+@dataclass
 class StepRunState:
     """Mutable persisted state for one step."""
 
@@ -137,20 +199,30 @@ class StepRunState:
     output_fingerprints: Dict[str, str] = field(default_factory=dict)
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
-    error: Optional[str] = None
+    error: Optional[FailureRecord] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "status": self.status.value,
             "attempts": self.attempts,
             "config_fingerprint": self.config_fingerprint,
-            "input_fingerprints": dict(sorted(self.input_fingerprints.items())),
+            "input_fingerprints": _portable_fingerprint_mapping(
+                self.input_fingerprints
+            ),
             "output_fingerprints": dict(
-                sorted(self.output_fingerprints.items())
+                sorted(
+                    _portable_fingerprint_mapping(
+                        self.output_fingerprints
+                    ).items()
+                )
             ),
             "started_at": self.started_at,
             "completed_at": self.completed_at,
-            "error": self.error,
+            "error": (
+                None
+                if self.error is None
+                else FailureRecord.from_value(self.error).to_dict()
+            ),
         }
 
     @classmethod
@@ -201,10 +273,7 @@ class StepRunState:
                 data.get("completed_at"),
                 f"steps.{step_name}.completed_at",
             ),
-            error=_optional_string(
-                data.get("error"),
-                f"steps.{step_name}.error",
-            ),
+            error=FailureRecord.from_value(data.get("error")),
         )
 
 
@@ -232,8 +301,26 @@ def _fingerprint_mapping(value: Any, field_name: str) -> Dict[str, str]:
             raise RunStateError(
                 f"{field_name}.{key} is not a lowercase SHA-256 fingerprint"
             )
-        fingerprints[key] = fingerprint
+        fingerprints[_portable_fingerprint_key(key)] = fingerprint
     return fingerprints
+
+
+def _portable_fingerprint_key(value: str) -> str:
+    if _SAFE_FINGERPRINT_KEY_RE.fullmatch(value):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"legacy.{digest}"
+
+
+def _portable_fingerprint_mapping(
+    value: Mapping[str, str],
+) -> Dict[str, str]:
+    return dict(
+        sorted(
+            (_portable_fingerprint_key(key), fingerprint)
+            for key, fingerprint in value.items()
+        )
+    )
 
 
 @dataclass

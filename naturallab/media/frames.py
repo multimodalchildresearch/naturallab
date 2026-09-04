@@ -212,7 +212,6 @@ class ImageDirectorySource(FrameSource):
                 timestamp_ns=timestamp_ns,
                 source_timestamp=source_timestamp,
                 metadata={
-                    "path": str(path),
                     "fps": self.fps,
                     "color_space": "RGB",
                     "timestamp_source": (
@@ -303,7 +302,6 @@ class VideoFileSource(FrameSource):
                         timestamp_ns=timestamp_ns,
                         source_timestamp=source_timestamp,
                         metadata={
-                            "path": str(self.path),
                             "fps": fps,
                             "color_space": "BGR",
                             "timestamp_source": timestamp_source,

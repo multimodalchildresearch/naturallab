@@ -1,8 +1,7 @@
 """Compatibility entry point for automatic calibration verification.
 
-Manual clicks and the former hidden 1.1 distance multiplier have been removed.
-Verification now measures automatically detected chessboard spans through a
-fixed calibration and never modifies or rescales that calibration.
+Verification measures automatically detected chessboard spans through a fixed
+calibration and preserves the metric scale declared by that calibration.
 """
 
 from __future__ import annotations

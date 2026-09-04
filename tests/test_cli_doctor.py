@@ -53,6 +53,32 @@ def test_qwen_extra_declares_the_quality_tracker_dependencies() -> None:
     assert "torchreid" not in qwen_extra
 
 
+def test_yolo_has_a_dedicated_strict_doctor_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    available = {requirement.module for requirement in doctor.MODULES["core"]}
+    monkeypatch.setattr(
+        doctor,
+        "_module_available",
+        lambda module: module in available,
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_distribution_version",
+        lambda distribution: "test",
+    )
+
+    report = doctor.run_doctor(profile="yolo", cwd=tmp_path)
+    yolo_check = next(
+        check for check in report.checks if check.details.get("profile") == "yolo"
+    )
+
+    assert yolo_check.status == "fail"
+    assert yolo_check.details["required"] is True
+    assert report.exit_code == 1
+
+
 def test_doctor_json_is_machine_readable(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = main(["doctor", "--profile", "core", "--json"])
 
@@ -65,7 +91,13 @@ def test_doctor_json_is_machine_readable(capsys: pytest.CaptureFixture[str]) -> 
     assert payload["checks"]
 
 
-def test_optional_missing_modules_are_warnings(
+def test_doctor_does_not_expose_the_working_directory(tmp_path: Path) -> None:
+    report = doctor.run_doctor(profile="core", cwd=tmp_path)
+
+    assert str(tmp_path) not in json.dumps(report.to_dict())
+
+
+def test_selected_profile_missing_modules_are_failures(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -86,8 +118,9 @@ def test_optional_missing_modules_are_warnings(
     ]
 
     assert acquisition_checks
-    assert all(check.status == "warning" for check in acquisition_checks)
-    assert report.exit_code == 0
+    assert all(check.status == "fail" for check in acquisition_checks)
+    assert all(check.details["required"] is True for check in acquisition_checks)
+    assert report.exit_code == 1
 
 
 def test_unwritable_working_directory_is_a_core_failure(

@@ -142,7 +142,7 @@ class RegisteredTrajectoryObservation:
 
 @dataclass(frozen=True)
 class ViewTrajectoryMetrics:
-    """Metrics for one local track, never merged across source views."""
+    """Observed chords for one local track, never a complete-path claim."""
 
     source_view_id: str
     source_camera_id: str
@@ -151,7 +151,10 @@ class ViewTrajectoryMetrics:
     observation_count: int
     first_timestamp_ns: int
     last_timestamp_ns: int
-    path_length: float
+    observed_chord_sum: float
+    chord_count: int
+    maximum_timestamp_gap_ns: Optional[int]
+    path_completeness: str
     units: str
 
 
@@ -310,7 +313,7 @@ def _compute_per_view_metrics(
         shared_identity = (
             next(iter(shared_identities)) if len(shared_identities) == 1 else None
         )
-        path_length = math.fsum(
+        observed_chord_sum = math.fsum(
             math.dist(
                 previous.room_floor_point,
                 current.room_floor_point,
@@ -322,6 +325,13 @@ def _compute_per_view_metrics(
         )
         first = track_observations[0]
         last = track_observations[-1]
+        timestamp_gaps = [
+            current.timestamp_ns - previous.timestamp_ns
+            for previous, current in zip(
+                track_observations,
+                track_observations[1:],
+            )
+        ]
         metrics.append(
             ViewTrajectoryMetrics(
                 source_view_id=first.source_view_id,
@@ -331,7 +341,12 @@ def _compute_per_view_metrics(
                 observation_count=len(track_observations),
                 first_timestamp_ns=first.timestamp_ns,
                 last_timestamp_ns=last.timestamp_ns,
-                path_length=path_length,
+                observed_chord_sum=observed_chord_sum,
+                chord_count=len(timestamp_gaps),
+                maximum_timestamp_gap_ns=(
+                    max(timestamp_gaps) if timestamp_gaps else None
+                ),
+                path_completeness="unassessed_no_expected_cadence",
                 units=first.units,
             )
         )

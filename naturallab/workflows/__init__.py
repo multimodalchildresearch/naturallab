@@ -18,6 +18,7 @@ from .runner import (
 )
 from .state import (
     RUN_STATE_SCHEMA_VERSION,
+    FailureRecord,
     RunState,
     RunStateError,
     StepRunState,
@@ -29,6 +30,7 @@ __all__ = [
     "MANIFEST_SCHEMA_VERSION",
     "RUN_STATE_SCHEMA_VERSION",
     "CalibrationPaths",
+    "FailureRecord",
     "ManifestError",
     "RunState",
     "RunStateError",

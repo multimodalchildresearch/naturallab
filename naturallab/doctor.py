@@ -2,7 +2,7 @@
 
 The doctor deliberately performs no downloads, network requests, or filesystem
 writes. It reports optional capabilities as warnings and treats prerequisites
-of an explicitly selected quality profile as failures.
+of an explicitly selected workflow profile as failures.
 """
 
 from __future__ import annotations
@@ -23,7 +23,15 @@ from naturallab import __version__
 
 
 MINIMUM_PYTHON = (3, 10)
-PROFILE_NAMES = ("core", "spatial", "gaze", "acquisition", "qwen", "all")
+PROFILE_NAMES = (
+    "core",
+    "spatial",
+    "yolo",
+    "gaze",
+    "acquisition",
+    "qwen",
+    "all",
+)
 VLM_BASE_URL_ENV = "NATURALLAB_VLM_BASE_URL"
 VLM_API_KEY_ENV = "NATURALLAB_VLM_API_KEY"
 REID_MODEL_PATH_ENV = "NATURALLAB_REID_MODEL_PATH"
@@ -48,12 +56,12 @@ MODULES: Dict[str, Tuple[ModuleRequirement, ...]] = {
     "spatial": (
         ModuleRequirement("torch", "torch", "model inference"),
         ModuleRequirement("torchvision", "torchvision", "vision operations"),
-        ModuleRequirement("ultralytics", "ultralytics", "YOLO detection"),
         ModuleRequirement("filterpy", "filterpy", "Kalman filtering"),
-        ModuleRequirement("matplotlib", "matplotlib", "diagnostic plots"),
-        ModuleRequirement("mediapipe", "mediapipe", "pose estimation"),
         ModuleRequirement("scipy", "scipy", "scientific calculations"),
         ModuleRequirement("transformers", "transformers", "model adapters"),
+    ),
+    "yolo": (
+        ModuleRequirement("ultralytics", "ultralytics", "YOLO detection"),
     ),
     "gaze": (
         ModuleRequirement("torch", "torch", "model inference"),
@@ -168,7 +176,6 @@ def _working_directory_check(cwd: Optional[Path] = None) -> CheckResult:
         )
 
     details = {
-        "path": str(directory),
         "exists": exists,
         "is_directory": is_directory,
         "writable": writable,
@@ -212,7 +219,7 @@ def _ffmpeg_check() -> CheckResult:
         "FFmpeg",
         "pass",
         "FFmpeg is available.",
-        {"available": True, "executable": executable},
+        {"available": True, "command": Path(executable).name},
     )
 
 
@@ -281,7 +288,7 @@ def _module_check(
 
 def _selected_profiles(profile: str) -> Tuple[str, ...]:
     if profile == "all":
-        return ("core", "spatial", "gaze", "acquisition", "qwen")
+        return ("core", "spatial", "yolo", "gaze", "acquisition", "qwen")
     if profile == "core":
         return ("core",)
     return ("core", profile)
@@ -294,7 +301,7 @@ def _module_checks(profile: str) -> Iterable[CheckResult]:
     ] = {}
     for selected_profile in _selected_profiles(profile):
         for requirement in MODULES[selected_profile]:
-            required = selected_profile in {"core", "qwen"}
+            required = True
             existing = selected_requirements.get(requirement.module)
             if existing is None or (required and not existing[1]):
                 selected_requirements[requirement.module] = (
@@ -598,7 +605,7 @@ def run_doctor(
         _ffmpeg_check(),
     ]
     checks.extend(_module_checks(profile))
-    if profile in {"spatial", "gaze", "all"}:
+    if profile in {"spatial", "yolo", "gaze", "all"}:
         checks.append(_cuda_check())
     if profile in {"qwen", "all"}:
         selected_environment = os.environ if environ is None else environ

@@ -104,7 +104,7 @@ def test_builtin_quality_preset_is_complete_and_exact() -> None:
     preset = load_spatial_pipeline_preset()
 
     assert preset.name == "qwen36_27b_quality"
-    assert preset.version == 2
+    assert preset.version == 3
     assert preset.vlm_service.model_id == DEFAULT_QWEN_MODEL_ID
     assert preset.vlm_service.max_tokens == 1024
     assert preset.vlm_service.enable_thinking is False
@@ -124,11 +124,6 @@ def test_builtin_quality_preset_is_complete_and_exact() -> None:
     assert preset.tracker.reid_model.size_bytes == DEFAULT_REID_SIZE_BYTES
     assert preset.tracker.reid_model.auto_download is True
     assert preset.tracker.allow_reid_fallback is False
-    assert preset.role_assignment.roles == ("child", "caregiver")
-    assert preset.role_assignment.role_description_mapping() == {
-        "child": "the infant participant",
-        "caregiver": "the adult caregiver participant",
-    }
 
 
 def test_factory_builds_exact_config_with_injected_runtime(
@@ -160,12 +155,7 @@ def test_factory_builds_exact_config_with_injected_runtime(
     assert components.detector.cadence_frames == 10
     assert components.detector.confidence_threshold is None
     assert components.detector.jpeg_quality == 95
-    assert components.role_assigner.roles == ("child", "caregiver")
-    assert components.role_assigner.role_descriptions == {
-        "child": "the infant participant",
-        "caregiver": "the adult caregiver participant",
-    }
-    assert components.role_assigner.evidence_images_per_track == 5
+    assert components.role_assigner is None
     assert components.pipeline.modules == [
         components.detector,
         components.tracker,
@@ -189,6 +179,9 @@ def test_factory_builds_exact_config_with_injected_runtime(
     assert provenance["vlm_max_tokens"] == 1024
     assert provenance["vlm_enable_thinking"] is False
     assert provenance["role_evidence_images_per_track"] == 5
+    assert provenance["role_assignment_enabled"] is False
+    assert provenance["roles"] == []
+    assert provenance["role_descriptions"] == {}
     assert provenance["reid_model"]["architecture"] == (
         DEFAULT_REID_ARCHITECTURE
     )
@@ -207,6 +200,37 @@ def test_factory_builds_exact_config_with_injected_runtime(
     assert output["pipeline_provenance"] == provenance
     assert "do-not-export" not in repr(output["pipeline_provenance"])
 
+
+def test_factory_builds_roles_only_from_an_explicit_arbitrary_mapping() -> None:
+    components = build_spatial_pipeline(
+        transport=EmptyGroundingTransport(),
+        deep_sort_factory=FakeDeepSORT,
+        feature_extractor=FakeFeatureExtractor(),
+        role_descriptions={
+            "participant": "the person completing the task",
+            "facilitator": "the person presenting the materials",
+        },
+    )
+
+    assert components.role_assigner is not None
+    assert components.role_assigner.roles == (
+        "participant",
+        "facilitator",
+    )
+    assert components.role_assigner.role_descriptions == {
+        "participant": "the person completing the task",
+        "facilitator": "the person presenting the materials",
+    }
+    assert components.role_assigner.evidence_images_per_track == 5
+    provenance = components.provenance()
+    assert provenance["role_assignment_enabled"] is True
+    assert provenance["roles"] == ["participant", "facilitator"]
+    assert provenance["role_descriptions"] == {
+        "participant": "the person completing the task",
+        "facilitator": "the person presenting the materials",
+    }
+    assert components.pipeline.provenance == provenance
+
     with pytest.raises(
         ValueError,
         match="evidence_images_per_track limit",
@@ -218,6 +242,104 @@ def test_factory_builds_exact_config_with_injected_runtime(
                 EvidenceImage(f"frame-{index}".encode())
                 for index in range(6)
             ],
+        )
+
+
+def test_deepsort_diagnostics_are_disabled_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    tracker = DeepSORTTracker(
+        feature_extractor=FakeFeatureExtractor(),
+        feature_gallery=FakeFeatureGallery(),
+    )
+
+    assert tracker.diagnostics is None
+    assert tracker.diagnostics_provenance == {
+        "enabled": False,
+        "path_policy": "explicit_new_or_empty_directory_required",
+        "output_directory_name": None,
+        "persisted_content": "none",
+        "persists_images": False,
+    }
+    assert not (tmp_path / "deepsort_diagnostics").exists()
+
+
+def test_deepsort_diagnostics_require_a_fresh_explicit_directory(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="diagnostics_output_dir"):
+        DeepSORTTracker(
+            enable_diagnostics=True,
+            feature_extractor=FakeFeatureExtractor(),
+            feature_gallery=FakeFeatureGallery(),
+        )
+
+    reused = tmp_path / "reused-diagnostics"
+    reused.mkdir()
+    (reused / "prior-run.txt").write_text("old", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="not empty"):
+        DeepSORTTracker(
+            enable_diagnostics=True,
+            diagnostics_output_dir=reused,
+            feature_extractor=FakeFeatureExtractor(),
+            feature_gallery=FakeFeatureGallery(),
+        )
+    assert (reused / "prior-run.txt").read_text(encoding="utf-8") == "old"
+
+
+def test_opt_in_deepsort_diagnostics_persist_text_only_and_are_provenanced(
+    tmp_path: Path,
+) -> None:
+    preset = load_spatial_pipeline_preset()
+    with_diagnostics = replace(
+        preset,
+        tracker=replace(preset.tracker, enable_diagnostics=True),
+    )
+    output_directory = tmp_path / "private-run" / "diagnostics"
+    components = build_spatial_pipeline(
+        preset=with_diagnostics,
+        transport=EmptyGroundingTransport(),
+        feature_extractor=FakeFeatureExtractor(),
+        feature_gallery=FakeFeatureGallery(),
+        diagnostics_output_dir=output_directory,
+    )
+
+    components.pipeline.process_frame(
+        np.zeros((60, 80, 3), dtype=np.uint8)
+    )
+    provenance = components.provenance()["diagnostics"]
+    assert provenance == {
+        "enabled": True,
+        "path_policy": "explicit_new_or_empty_directory_required",
+        "output_directory_name": "diagnostics",
+        "persisted_content": "text_log_only",
+        "persists_images": False,
+    }
+    assert str(tmp_path) not in repr(provenance)
+    assert (output_directory / "deepsort_log.txt").is_file()
+    assert not list(output_directory.rglob("*.jpg"))
+
+
+@pytest.mark.parametrize(
+    "role_descriptions",
+    [
+        {},
+        {"": "a participant"},
+        {"participant": ""},
+        {"participant": 3},
+        [("participant", "a participant")],
+    ],
+)
+def test_factory_rejects_invalid_explicit_role_descriptions(
+    role_descriptions: Any,
+) -> None:
+    with pytest.raises(PipelineConfigError, match="role"):
+        build_spatial_pipeline(
+            deep_sort_factory=FakeDeepSORT,
+            feature_extractor=FakeFeatureExtractor(),
+            role_descriptions=role_descriptions,
         )
 
 
@@ -351,6 +473,21 @@ def test_factory_fallback_requires_opt_in_and_is_recorded(
     assert provenance["fallback_used"] is True
     assert provenance["failure_category"] == "configured-checkpoint-invalid"
     assert provenance["reid_backend"] == "histogram"
+
+
+def test_injected_tracker_cannot_bypass_strict_fallback_policy() -> None:
+    class HistogramDeepSORT(FakeDeepSORT):
+        reid_backend = "histogram"
+
+    with pytest.raises(
+        PipelineDependencyError,
+        match="allow_reid_fallback was not enabled",
+    ):
+        build_spatial_pipeline(
+            transport=EmptyGroundingTransport(),
+            deep_sort_factory=HistogramDeepSORT,
+            feature_extractor=FakeFeatureExtractor(),
+        )
 
 
 def test_unknown_preset_fails_clearly() -> None:

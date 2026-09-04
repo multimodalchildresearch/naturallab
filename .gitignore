@@ -71,3 +71,9 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Resumable workflow state (may contain study/session diagnostics)
+*.run-state.json
+run-state.json
+*run-state.json.lock
+.*run-state.json.*.tmp

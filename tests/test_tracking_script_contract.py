@@ -11,19 +11,23 @@ from naturallab.spatial_tracking.calibration import (
     IntrinsicCalibrationArtifact,
 )
 from scripts.track_people_in_video import (
+    FLOOR_STATISTICS_OUTPUT_COLUMNS,
     STATISTICS_OUTPUT_COLUMNS,
     TRACK_OUTPUT_COLUMNS,
     add_distance_statistics,
     build_argument_parser,
     build_video_output_plan,
+    configured_role_evidence_limit,
     discover_video_files,
     expected_decoded_frame_count,
+    floor_metric_provenance,
     load_floor_tracker,
     main,
     prepare_video_output,
     probe_video,
     select_track_evidence_rows,
     summarize_track_records,
+    validate_cli_args,
     validate_video_output_plan,
     write_track_tables,
 )
@@ -49,7 +53,7 @@ def test_floor_tracker_accepts_canonical_calibration_keys(tmp_path: Path) -> Non
 
     np.testing.assert_allclose(tracker.camera_matrix, np.eye(3))
     np.testing.assert_allclose(tracker.floor_plane, [0, 1, 0, -1000])
-    assert tracker.correction_factor == 1.0
+    assert not hasattr(tracker, "correction_factor")
 
 
 def test_floor_tracker_migrates_consolidated_script_keys(tmp_path: Path) -> None:
@@ -67,14 +71,14 @@ def test_floor_tracker_migrates_consolidated_script_keys(tmp_path: Path) -> None
         {"plane_normal": [0, 1, 0], "plane_d": -1000},
     )
 
-    tracker = load_floor_tracker(camera_path, floor_path, correction_factor=1.25)
+    tracker = load_floor_tracker(camera_path, floor_path)
 
     np.testing.assert_allclose(tracker.dist_coeffs, [0, 0, 0, 0, 0])
     np.testing.assert_allclose(tracker.floor_plane, [0, 1, 0, -1000])
-    assert tracker.correction_factor == 1.25
+    assert not hasattr(tracker, "correction_factor")
 
 
-def test_floor_tracker_scales_outlier_thresholds_to_calibration_units(
+def test_floor_tracker_has_no_hidden_per_update_distance_filter(
     tmp_path: Path,
 ) -> None:
     camera_path = tmp_path / "intrinsics.yaml"
@@ -96,9 +100,86 @@ def test_floor_tracker_scales_outlier_thresholds_to_calibration_units(
     )
 
     tracker = load_floor_tracker(camera_path, floor_path)
+    positions = iter(
+        (
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.001, 0.0, 1.0]),
+            np.array([0.501, 0.0, 1.0]),
+        )
+    )
+    tracker.project_to_floor = lambda _point: next(positions)
 
-    assert tracker.min_movement == pytest.approx(0.005)
-    assert tracker.max_movement == pytest.approx(0.2)
+    for _ in range(3):
+        tracker.update_track("participant", [0, 0, 10, 10])
+
+    assert tracker.get_distance("participant") == pytest.approx(0.501)
+
+
+def test_floor_tracker_accumulates_unscaled_calibration_distance(
+    tmp_path: Path,
+) -> None:
+    camera_path = tmp_path / "intrinsics.yaml"
+    floor_path = tmp_path / "floor.yaml"
+    write_yaml(
+        camera_path,
+        {
+            "camera_matrix": np.eye(3).tolist(),
+            "dist_coeff": [0, 0, 0, 0, 0],
+        },
+    )
+    write_yaml(floor_path, {"floor_plane": [0, 1, 0, -1000]})
+    tracker = load_floor_tracker(camera_path, floor_path)
+    positions = iter(
+        (
+            np.array([0.0, 0.0, 1000.0]),
+            np.array([10.0, 0.0, 1000.0]),
+        )
+    )
+    tracker.project_to_floor = lambda _point: next(positions)
+
+    tracker.update_track("participant", [0, 0, 10, 10])
+    tracker.update_track("participant", [0, 0, 10, 10])
+
+    assert tracker.get_distance("participant") == pytest.approx(10.0)
+
+
+def test_floor_tracker_ignores_nonfinite_projected_positions(
+    tmp_path: Path,
+) -> None:
+    camera_path = tmp_path / "intrinsics.yaml"
+    floor_path = tmp_path / "floor.yaml"
+    write_yaml(
+        camera_path,
+        {
+            "camera_matrix": np.eye(3).tolist(),
+            "dist_coeff": [0, 0, 0, 0, 0],
+        },
+    )
+    write_yaml(floor_path, {"floor_plane": [0, 1, 0, -1000]})
+    tracker = load_floor_tracker(camera_path, floor_path)
+    positions = iter(
+        (
+            np.array([0.0, 0.0, 1000.0]),
+            np.array([np.nan, 0.0, 1000.0]),
+            np.array([10.0, 0.0, 1000.0]),
+        )
+    )
+    tracker.project_to_floor = lambda _point: next(positions)
+
+    assert tracker.update_track("participant", [0, 0, 10, 10]) is not None
+    assert tracker.update_track("participant", [0, 0, 10, 10]) is None
+    assert tracker.update_track("participant", [0, 0, 10, 10]) is not None
+
+    assert tracker.get_distance("participant") == pytest.approx(10.0)
+    assert tracker.get_projection_summary("participant") == {
+        "floor_projection_attempts": 3,
+        "floor_projection_valid": 2,
+        "floor_projection_missed": 1,
+        "floor_projection_gap_count": 1,
+        "floor_projection_coverage": pytest.approx(2 / 3),
+        "distance_complete": False,
+        "distance_status": "partial_projection_gaps",
+    }
 
 
 def test_floor_tracker_validates_versioned_artifact_binding(tmp_path: Path) -> None:
@@ -125,6 +206,22 @@ def test_floor_tracker_validates_versioned_artifact_binding(tmp_path: Path) -> N
 
     assert tracker.calibration_bundle is not None
     assert tracker.units == "mm"
+    metric_provenance = floor_metric_provenance(tracker)
+    assert metric_provenance == {
+        "units": "mm",
+        "scale_source": "canonical-calibration",
+        "distance_accumulation": (
+            "all_finite_consecutive_floor_displacements"
+        ),
+        "projection_gap_policy": (
+            "bridge_valid_endpoints_and_mark_distance_partial"
+        ),
+        "completeness_output": "per-track track_statistics.csv fields",
+        "per_update_filter": None,
+        "camera_id": "ceiling-01",
+        "intrinsic_sha256": intrinsics.sha256,
+        "floor_sha256": floor.sha256,
+    }
 
     tampered = floor.to_dict()
     tampered["intrinsic_sha256"] = "0" * 64
@@ -133,51 +230,71 @@ def test_floor_tracker_validates_versioned_artifact_binding(tmp_path: Path) -> N
         load_floor_tracker(camera_path, floor_path)
 
 
-def test_versioned_calibration_rejects_empirical_correction_factor(
-    tmp_path: Path,
-) -> None:
-    intrinsics = IntrinsicCalibrationArtifact(
-        camera_id="ceiling-01",
-        image_size=ImageSize(640, 480),
-        camera_matrix=np.eye(3).tolist(),
-        dist_coeff=[0, 0, 0, 0, 0],
-    )
-    floor = FloorPlaneCalibrationArtifact(
-        camera_id=intrinsics.camera_id,
-        image_size=intrinsics.image_size,
-        floor_plane=[0, 1, 0, -1000],
-        units="mm",
-        coordinate_frame=intrinsics.coordinate_frame,
-        intrinsic_sha256=intrinsics.sha256,
-    )
-    camera_path = tmp_path / "intrinsics.yaml"
-    floor_path = tmp_path / "floor.yaml"
-    write_yaml(camera_path, intrinsics.to_dict())
-    write_yaml(floor_path, floor.to_dict())
-
-    with pytest.raises(ValueError, match="legacy option"):
-        load_floor_tracker(
-            camera_path,
-            floor_path,
-            correction_factor=1.2,
-        )
-
-
-def test_legacy_correction_factor_is_hidden_from_tracking_help() -> None:
+def test_tracking_cli_rejects_removed_correction_factor() -> None:
     parser = build_argument_parser()
 
     assert "--correction-factor" not in parser.format_help()
-    args = parser.parse_args(
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--input",
+                "video.mp4",
+                "--output",
+                "results",
+                "--correction-factor",
+                "1.25",
+            ]
+        )
+
+
+def test_identity_evidence_limit_comes_from_quality_preset() -> None:
+    parser = build_argument_parser()
+    limit = configured_role_evidence_limit()
+    defaults = parser.parse_args(
+        ["--input", "video.mp4", "--output", "results"]
+    )
+
+    assert defaults.identity_evidence_frames == limit == 5
+
+    excessive = parser.parse_args(
         [
             "--input",
             "video.mp4",
             "--output",
             "results",
-            "--correction-factor",
-            "1.25",
+            "--identity-evidence-frames",
+            str(limit + 1),
         ]
     )
-    assert args.correction_factor == pytest.approx(1.25)
+    with pytest.raises(SystemExit):
+        validate_cli_args(parser, excessive)
+
+
+def test_tracking_cli_does_not_advertise_reserved_no_op_options() -> None:
+    parser = build_argument_parser()
+    help_text = parser.format_help()
+
+    assert "--visualize" not in help_text
+    assert "--batch-size" not in help_text
+    assert parser.parse_args(
+        ["--input", "video.mp4", "--output", "results"]
+    ).yolo_model == "yolo11n.pt"
+
+
+def test_tracking_cli_rejects_two_role_description_sources() -> None:
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--input",
+                "video.mp4",
+                "--output",
+                "results",
+                "--identities",
+                '{"participant":"person"}',
+                "--identity-file",
+                "roles.json",
+            ]
+        )
 
 
 def test_distance_statistics_use_declared_units() -> None:
@@ -209,33 +326,6 @@ def test_distance_statistics_use_declared_units() -> None:
     }
 
 
-@pytest.mark.parametrize(
-    "correction_factor",
-    [0, -1, float("nan"), float("inf"), float("-inf"), True],
-)
-def test_floor_tracker_rejects_invalid_legacy_correction_factor(
-    tmp_path: Path,
-    correction_factor,
-) -> None:
-    camera_path = tmp_path / "intrinsics.yaml"
-    floor_path = tmp_path / "floor.yaml"
-    write_yaml(
-        camera_path,
-        {
-            "camera_matrix": np.eye(3).tolist(),
-            "dist_coeff": [0, 0, 0, 0, 0],
-        },
-    )
-    write_yaml(floor_path, {"floor_plane": [0, 1, 0, -1000]})
-
-    with pytest.raises(ValueError, match="finite positive"):
-        load_floor_tracker(
-            camera_path,
-            floor_path,
-            correction_factor=correction_factor,
-        )
-
-
 def test_track_statistics_separate_observations_and_predictions() -> None:
     import pandas as pd
 
@@ -257,6 +347,8 @@ def test_track_statistics_separate_observations_and_predictions() -> None:
         "covered_frame_count": 6,
         "duration_seconds": 2.5,
         "timing_basis": "nominal_fps",
+        "timestamp_validation_status": "not_available",
+        "timestamp_source_kinds": "",
     }
 
 
@@ -268,6 +360,7 @@ def test_track_statistics_prefer_source_timestamps_for_vfr() -> None:
             "frame": [10, 11, 12],
             "is_prediction": [False, True, False],
             "timestamp_seconds": [1.0, 1.04, 1.11],
+            "timestamp_source": ["container_pts"] * 3,
         }
     )
 
@@ -276,7 +369,54 @@ def test_track_statistics_prefer_source_timestamps_for_vfr() -> None:
     assert stat["first_timestamp_seconds"] == 1.0
     assert stat["last_timestamp_seconds"] == 1.11
     assert stat["duration_seconds"] == pytest.approx(0.11)
-    assert stat["timing_basis"] == "source_timestamps"
+    assert stat["timing_basis"] == "source_timestamps:container_pts"
+    assert stat["timestamp_validation_status"] == "valid"
+    assert stat["timestamp_source_kinds"] == "container_pts"
+
+
+def test_track_statistics_disclose_mixed_timestamp_sources() -> None:
+    import pandas as pd
+
+    track_df = pd.DataFrame(
+        {
+            "frame": [0, 1, 2],
+            "timestamp_seconds": [0.0, 0.04, 0.08],
+            "timestamp_source": [
+                "container_pts",
+                "synthesized_fps",
+                "synthesized_fps",
+            ],
+        }
+    )
+
+    stat = summarize_track_records("track-1", track_df, fps=25.0)
+
+    assert stat["duration_seconds"] == pytest.approx(0.08)
+    assert stat["timing_basis"] == "mixed_source_timestamps"
+    assert stat["timestamp_validation_status"] == "valid"
+    assert stat["timestamp_source_kinds"] == (
+        "container_pts|synthesized_fps"
+    )
+
+
+def test_track_statistics_reject_nonmonotonic_source_timestamps() -> None:
+    import pandas as pd
+
+    track_df = pd.DataFrame(
+        {
+            "frame": [0, 1, 2],
+            "timestamp_seconds": [1.0, 0.9, 1.1],
+            "timestamp_source": ["container_pts"] * 3,
+        }
+    )
+
+    stat = summarize_track_records("track-1", track_df, fps=25.0)
+
+    assert stat["duration_seconds"] == pytest.approx(0.08)
+    assert stat["timing_basis"] == "nominal_fps"
+    assert stat["timestamp_validation_status"] == "nonmonotonic"
+    assert "first_timestamp_seconds" not in stat
+    assert "last_timestamp_seconds" not in stat
 
 
 @pytest.mark.parametrize(
@@ -431,6 +571,78 @@ def test_zero_track_run_writes_stable_empty_csv_contracts(
     ).columns.tolist() == list(STATISTICS_OUTPUT_COLUMNS)
 
 
+def test_floor_statistics_export_projection_completeness(
+    tmp_path: Path,
+) -> None:
+    import pandas as pd
+
+    camera_path = tmp_path / "intrinsics.yaml"
+    floor_path = tmp_path / "floor.yaml"
+    write_yaml(
+        camera_path,
+        {
+            "camera_matrix": np.eye(3).tolist(),
+            "dist_coeff": [0, 0, 0, 0, 0],
+        },
+    )
+    write_yaml(floor_path, {"floor_plane": [0, 1, 0, -1000]})
+    tracker = load_floor_tracker(camera_path, floor_path)
+    positions = iter((np.array([0.0, 0.0, 1000.0]), None))
+    tracker.project_to_floor = lambda _point: next(positions)
+    first = tracker.update_track("participant", [0, 0, 10, 10])
+    assert first is not None
+    assert tracker.update_track("participant", [0, 0, 10, 10]) is None
+
+    rows = [
+        {
+            "frame": 0,
+            "track_id": "participant",
+            "x1": 0,
+            "y1": 0,
+            "x2": 10,
+            "y2": 10,
+            "confidence": 0.9,
+            "is_prediction": False,
+            "timestamp_seconds": 0.0,
+            "timestamp_ns": 0,
+            "timestamp_source": "test",
+            "floor_x": first[0],
+            "floor_y": first[1],
+            "floor_z": first[2],
+        },
+        {
+            "frame": 1,
+            "track_id": "participant",
+            "x1": 0,
+            "y1": 0,
+            "x2": 10,
+            "y2": 10,
+            "confidence": 0.9,
+            "is_prediction": False,
+            "timestamp_seconds": 0.04,
+            "timestamp_ns": 40_000_000,
+            "timestamp_source": "test",
+        },
+    ]
+    _, statistics = write_track_tables(
+        tmp_path,
+        rows,
+        fps=25.0,
+        floor_tracker=tracker,
+    )
+
+    row = statistics.iloc[0]
+    assert row["floor_projection_attempts"] == 2
+    assert row["floor_projection_valid"] == 1
+    assert row["floor_projection_missed"] == 1
+    assert row["floor_projection_gap_count"] == 1
+    assert row["floor_projection_coverage"] == pytest.approx(0.5)
+    assert bool(row["distance_complete"]) is False
+    assert row["distance_status"] == "partial_projection_gaps"
+    persisted = pd.read_csv(tmp_path / "track_statistics.csv")
+    assert set(FLOOR_STATISTICS_OUTPUT_COLUMNS).issubset(persisted.columns)
+
+
 def test_empty_input_directory_returns_nonzero_without_creating_output(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -552,6 +764,76 @@ def test_truncated_video_returns_nonzero_and_discards_partial_results(
     assert not (output_path / "truncated").exists()
 
 
+def test_failed_requested_frame_encoding_discards_partial_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    import cv2
+
+    import naturallab.media
+    import naturallab.spatial_tracking.detection.yolo_detector as yolo_module
+    import scripts.track_people_in_video as tracking_script
+
+    class EmptyDetector:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def process(self, data):
+            return {
+                **data,
+                "detections": [],
+                "detection_metadata": {"skipped": False},
+                "detection_provenance": {"backend": "test-empty"},
+            }
+
+    class OneFrameSource:
+        def __init__(self, path, *, stop_frame=None) -> None:
+            self.path = path
+            self.stop_frame = stop_frame
+
+        def __iter__(self):
+            yield SimpleNamespace(
+                frame_index=0,
+                image=np.zeros((16, 16, 3), dtype=np.uint8),
+                metadata={"timestamp_source": "test"},
+                source_timestamp=0.0,
+                timestamp_ns=0,
+            )
+
+    monkeypatch.setattr(yolo_module, "YOLODetectorModule", EmptyDetector)
+    monkeypatch.setattr(naturallab.media, "VideoFileSource", OneFrameSource)
+    monkeypatch.setattr(
+        tracking_script,
+        "probe_video",
+        lambda _path: (1, 25.0),
+    )
+    monkeypatch.setattr(cv2, "imwrite", lambda *_args, **_kwargs: False)
+    input_path = tmp_path / "session.mp4"
+    input_path.write_bytes(b"test fixture")
+    output_path = tmp_path / "results"
+
+    result = main(
+        [
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--save-frames",
+            "--frame-interval",
+            "1",
+        ]
+    )
+
+    captured = capsys.readouterr().out
+    assert result == 1
+    assert "could not encode annotated frame" in captured
+    assert "Processing complete!" not in captured
+    assert not (output_path / "session").exists()
+
+
 @pytest.mark.parametrize(
     ("total_frames", "max_frames", "expected"),
     [
@@ -627,6 +909,8 @@ def test_valid_zero_detection_run_writes_all_requested_empty_outputs(
             str(input_path),
             "--output",
             str(output_path),
+            "--yolo-model",
+            str(tmp_path / "private" / "local-model.pt"),
             "--identities",
             '{"participant":"the study participant"}',
         ]
@@ -640,6 +924,15 @@ def test_valid_zero_detection_run_writes_all_requested_empty_outputs(
         (video_output / "identity_matches.json").read_text(encoding="utf-8")
     )
     assert identity_output["assignments"] == {}
+    run_metadata = json.loads(
+        (video_output / "run_metadata.json").read_text(encoding="utf-8")
+    )
+    assert run_metadata["input_video"] == "session.mp4"
+    assert run_metadata["detector_settings"]["model_path"] == (
+        "local-model.pt"
+    )
+    assert run_metadata["metric_tracking"] is None
+    assert str(tmp_path) not in repr(run_metadata)
     assert not (video_output / "frames").exists()
 
 

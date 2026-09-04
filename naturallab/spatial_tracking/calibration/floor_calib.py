@@ -1,9 +1,4 @@
-"""Compatibility entry point for automatic floor-plane calibration.
-
-The former GUI manually accepted positions and reconstructed corners by
-scaling rays with ``t_z``.  The supported path detects stationary placements
-automatically and uses the complete PnP transform ``R @ X + t``.
-"""
+"""Compatibility entry point for the supported automatic floor calibration."""
 
 from __future__ import annotations
 

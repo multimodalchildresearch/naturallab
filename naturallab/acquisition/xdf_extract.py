@@ -1,25 +1,19 @@
 #!/usr/bin/env python
-"""
-XDF Extractor (Fixed)
--------------------
-This script extracts all data streams from an XDF file into individual files.
-Fixed version with better handling of different data formats.
-
-Usage:
-    python xdf_extract_fixed.py --file recording.xdf --outdir extracted_data
-"""
+"""Strict, transactional extraction of NaturalLab XDF recordings."""
 
 import os
 import sys
 import argparse
 import base64
+import hashlib
 import json
 import re
+import shutil
+import tempfile
 import time
 import numpy as np
 import pandas as pd
 import cv2
-from datetime import datetime
 
 try:
     import pyxdf
@@ -62,44 +56,109 @@ def _is_declared_imu_stream(stream):
 
 def _safe_filename_component(value):
     """Make a deterministic, portable filename component."""
-    component = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower())
-    return component.strip("_") or "stream"
+    original = str(value).strip()
+    component = re.sub(r"[^a-z0-9]+", "_", original.lower()).strip("_")
+    component = component or "stream"
+    if len(component) > 80:
+        digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:12]
+        component = f"{component[:67].rstrip('_')}_{digest}"
+    if component in {"con", "prn", "aux", "nul"}:
+        component = f"stream_{component}"
+    return component
 
 
-def _plan_imu_output_filenames(streams):
-    """Choose non-colliding IMU filenames while retaining single-stream output."""
-    if len(streams) == 1:
-        return ["imu.csv"]
+def _stream_output_paths(stream, stem):
+    """Return every relative path reserved by one extracted stream."""
 
-    filenames = []
-    occurrences = {}
-    for stream in streams:
-        stem = f"imu_{_safe_filename_component(_stream_name(stream))}"
-        occurrences[stem] = occurrences.get(stem, 0) + 1
-        occurrence = occurrences[stem]
-        suffix = "" if occurrence == 1 else f"_{occurrence}"
-        filenames.append(f"{stem}{suffix}.csv")
-    return filenames
+    stream_type = _stream_type(stream).strip().lower()
+    if _is_declared_imu_stream(stream):
+        return {f"{stem}.csv"}
+    if stream_type == "videostream":
+        return {f"{stem}.mp4", f"{stem}_timestamps.csv"}
+    if stream_type == "audio":
+        return {f"{stem}.wav", f"{stem}_timestamps.csv"}
+    if stream_type in {"depth", "depthdata"}:
+        return {
+            f"{stem}_depth",
+            f"{stem}_visualization.mp4",
+            f"{stem}_timestamps.csv",
+            f"{stem}_depth_metadata.json",
+        }
+    if stream_type == "deviceinfo":
+        return {f"{stem}.json"}
+    return {f"{stem}.csv"}
 
 
-def _prepare_extraction_output_dir(output_dir):
-    """Create an empty output directory or reject stale/reused results."""
-    output_dir = os.path.abspath(os.fspath(output_dir))
-    if os.path.lexists(output_dir):
-        if os.path.islink(output_dir) or not os.path.isdir(output_dir):
+def _plan_stream_output_stems(streams):
+    """Plan safe unique stems and reject every output-path ambiguity."""
+
+    stem_owners = {}
+    path_owners = {}
+    planned = {}
+    for index, stream in enumerate(streams):
+        original_name = _stream_name(stream)
+        if original_name == "<unknown>" or not original_name.strip():
+            raise RuntimeError(f"XDF stream {index} has no usable name")
+        stem = _safe_filename_component(original_name)
+        existing_stem = stem_owners.get(stem.casefold())
+        if existing_stem is not None:
             raise RuntimeError(
-                f"XDF output path is not a normal directory: {output_dir}"
+                "ambiguous XDF stream names map to the same output stem "
+                f"{stem!r}: {existing_stem!r} and {original_name!r}"
             )
-        with os.scandir(output_dir) as entries:
+        stem_owners[stem.casefold()] = original_name
+        for relative_path in _stream_output_paths(stream, stem):
+            key = relative_path.casefold()
+            existing_path = path_owners.get(key)
+            if existing_path is not None:
+                raise RuntimeError(
+                    "ambiguous XDF streams would share output path "
+                    f"{relative_path!r}: {existing_path!r} and {original_name!r}"
+                )
+            path_owners[key] = original_name
+        planned[id(stream)] = stem
+    return planned
+
+
+def _resolved_output_stem(stream_name, output_stem=None):
+    """Return a safe stem even for direct extractor calls."""
+
+    return _safe_filename_component(
+        stream_name if output_stem is None else output_stem
+    )
+
+
+def _prepare_extraction_staging_dir(output_dir):
+    """Validate the final target and create a same-filesystem staging tree."""
+
+    final_output_dir = os.path.abspath(os.fspath(output_dir))
+    if os.path.lexists(final_output_dir):
+        if os.path.islink(final_output_dir) or not os.path.isdir(final_output_dir):
+            raise RuntimeError(
+                "XDF output path is not a normal directory: "
+                f"{final_output_dir}"
+            )
+        with os.scandir(final_output_dir) as entries:
             if next(entries, None) is not None:
                 raise RuntimeError(
-                    f"XDF output directory is not empty: {output_dir}. "
+                    "XDF output directory is not empty: "
+                    f"{final_output_dir}. "
                     "Choose a new empty directory so stale files cannot be "
                     "mistaken for this extraction."
                 )
-    else:
-        os.makedirs(output_dir)
-    return output_dir
+    parent_dir = os.path.dirname(final_output_dir)
+    os.makedirs(parent_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(
+        prefix=f".{os.path.basename(final_output_dir)}.staging-",
+        dir=parent_dir,
+    )
+    return final_output_dir, staging_dir
+
+
+def _publish_extraction_staging_dir(staging_dir, final_output_dir):
+    """Atomically publish a complete staging directory over an empty target."""
+
+    os.replace(staging_dir, final_output_dir)
 
 
 def _unwrap_singleton(value):
@@ -112,6 +171,222 @@ def _unwrap_singleton(value):
             value = value[0]
             continue
         return value
+
+
+def _declared_channel_count(stream, stream_name):
+    """Return one positive channel count from XDF metadata."""
+
+    try:
+        raw_count = _unwrap_singleton(stream["info"]["channel_count"])
+        channel_count = int(raw_count)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"invalid declared channel count for {stream_name}"
+        ) from error
+    if channel_count <= 0:
+        raise RuntimeError(
+            f"invalid declared channel count for {stream_name}: "
+            f"{channel_count!r}"
+        )
+    return channel_count
+
+
+def _declared_channel_labels(stream, stream_name, channel_count):
+    """Read an exact, unique channel-label list from the stream description."""
+
+    description = stream.get("info", {}).get("desc")
+    channel_groups = _metadata_values_for_keys(description, {"channels"})
+    if len(channel_groups) != 1:
+        raise RuntimeError(
+            f"{stream_name} must declare exactly one channel-label group; "
+            f"found {len(channel_groups)}"
+        )
+    group = _unwrap_singleton(channel_groups[0])
+    if not isinstance(group, dict):
+        raise RuntimeError(f"invalid channel-label metadata for {stream_name}")
+    channel_key = next(
+        (key for key in group if str(key).lower() == "channel"),
+        None,
+    )
+    if channel_key is None:
+        raise RuntimeError(f"no channel labels declared for {stream_name}")
+    entries = group[channel_key]
+    if not isinstance(entries, (list, tuple)):
+        entries = [entries]
+
+    labels = []
+    for index, entry in enumerate(entries):
+        label_values = _metadata_values_for_keys(entry, {"label"})
+        if len(label_values) != 1:
+            raise RuntimeError(
+                f"channel {index} of {stream_name} must declare exactly one label"
+            )
+        label = str(_unwrap_singleton(label_values[0])).strip()
+        if not label:
+            raise RuntimeError(f"channel {index} of {stream_name} has no label")
+        labels.append(label)
+
+    if len(labels) != channel_count:
+        raise RuntimeError(
+            f"channel-label mismatch for {stream_name}: metadata declares "
+            f"{channel_count} channels but provides {len(labels)} labels"
+        )
+    if len(set(labels)) != len(labels):
+        raise RuntimeError(f"duplicate channel labels in {stream_name}")
+    return labels
+
+
+def _validated_lsl_timestamps(timestamps, sample_count, stream_name):
+    """Validate one finite, strictly increasing LSL timestamp per sample."""
+
+    try:
+        values = np.asarray(timestamps, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"timestamps are not numeric for {stream_name}"
+        ) from error
+    if values.ndim != 1:
+        raise RuntimeError(
+            f"timestamps for {stream_name} must be one-dimensional; "
+            f"got shape {values.shape!r}"
+        )
+    if len(values) != sample_count:
+        raise RuntimeError(
+            f"timestamp/sample mismatch for {stream_name}: {len(values)} "
+            f"timestamps for {sample_count} samples"
+        )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError(f"timestamps are not finite for {stream_name}")
+    if len(values) > 1 and np.any(np.diff(values) <= 0):
+        raise RuntimeError(
+            f"timestamps are not strictly increasing for {stream_name}"
+        )
+    return values
+
+
+def _validated_numeric_stream(
+    stream,
+    stream_name,
+    *,
+    optional_nan_labels=(),
+):
+    """Validate a labelled rectangular numeric stream and its LSL timeline."""
+
+    channel_count = _declared_channel_count(stream, stream_name)
+    labels = _declared_channel_labels(stream, stream_name, channel_count)
+    raw_data = stream.get("time_series")
+    if raw_data is None or len(raw_data) == 0:
+        raise RuntimeError(f"no samples found in stream: {stream_name}")
+    try:
+        values = np.asarray(raw_data, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"samples are not a rectangular numeric array for {stream_name}"
+        ) from error
+    raw_timestamps = stream.get("time_stamps")
+    timestamp_count = len(raw_timestamps) if raw_timestamps is not None else 0
+    if (
+        values.ndim == 1
+        and timestamp_count == 1
+        and len(values) == channel_count
+    ):
+        values = values.reshape(1, channel_count)
+    if values.ndim != 2:
+        raise RuntimeError(
+            f"samples for {stream_name} must be a sample-by-channel matrix; "
+            f"got shape {values.shape!r}"
+        )
+    if values.shape[1] != channel_count:
+        raise RuntimeError(
+            f"channel mismatch for {stream_name}: metadata declares "
+            f"{channel_count}, data has {values.shape[1]}"
+        )
+
+    optional = set(optional_nan_labels)
+    unknown_optional = optional - set(labels)
+    if unknown_optional:
+        optional = optional & set(labels)
+    for index, label in enumerate(labels):
+        column = values[:, index]
+        if label in optional:
+            if np.any(np.isinf(column)):
+                raise RuntimeError(
+                    f"optional channel {label!r} contains infinity in {stream_name}"
+                )
+        elif not np.all(np.isfinite(column)):
+            raise RuntimeError(
+                f"channel {label!r} contains non-finite samples in {stream_name}"
+            )
+
+    timestamps = _validated_lsl_timestamps(
+        raw_timestamps,
+        len(values),
+        stream_name,
+    )
+    return values, timestamps, labels
+
+
+def _write_dataframe_atomic(dataframe, output_file):
+    """Write one CSV without publishing a partial file on failure."""
+
+    output_file = os.fspath(output_file)
+    directory = os.path.dirname(output_file)
+    basename = os.path.basename(output_file)
+    partial_file = os.path.join(directory, f".{basename}.partial")
+    try:
+        dataframe.to_csv(partial_file, index=False)
+        os.replace(partial_file, output_file)
+    except Exception:
+        try:
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _remove_output_path(path):
+    """Remove one managed file or directory during rollback."""
+
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    else:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+
+def _publish_staged_outputs(staging_dir, output_dir, relative_paths):
+    """Publish a group and roll back every member if any rename fails."""
+
+    os.makedirs(output_dir, exist_ok=True)
+    desired = list(relative_paths)
+    existing_names = {
+        entry.name.casefold(): entry.name
+        for entry in os.scandir(output_dir)
+        if entry.name != os.path.basename(staging_dir)
+    }
+    conflicts = [
+        relative_path
+        for relative_path in desired
+        if relative_path.casefold() in existing_names
+    ]
+    if conflicts:
+        raise RuntimeError(
+            "managed output already exists: " + ", ".join(sorted(conflicts))
+        )
+
+    published = []
+    try:
+        for relative_path in desired:
+            source = os.path.join(staging_dir, relative_path)
+            destination = os.path.join(output_dir, relative_path)
+            os.replace(source, destination)
+            published.append(destination)
+    except Exception:
+        for destination in reversed(published):
+            _remove_output_path(destination)
+        raise
 
 
 def _metadata_values_for_keys(payload, keys):
@@ -304,13 +579,62 @@ def _decode_lsl_video_frame(frame_data, frame_index, stream_name):
     return frame
 
 
-def extract_video_stream(stream, output_dir, name=None):
+def _verify_video_file(path, expected_frames, expected_size, stream_name):
+    """Reopen and fully decode staged video before publishing it."""
+
+    capture = cv2.VideoCapture(path)
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError(
+            f"could not reopen staged video for {stream_name}"
+        )
+    decoded_frames = 0
+    expected_width, expected_height = expected_size
+    try:
+        while True:
+            decoded, frame = capture.read()
+            if not decoded:
+                break
+            if frame is None or frame.shape[:2] != (
+                expected_height,
+                expected_width,
+            ):
+                actual_shape = None if frame is None else frame.shape[:2]
+                raise RuntimeError(
+                    f"staged video frame {decoded_frames} for {stream_name} "
+                    f"has shape {actual_shape!r}; expected "
+                    f"{(expected_height, expected_width)!r}"
+                )
+            decoded_frames += 1
+            if decoded_frames > expected_frames:
+                break
+    finally:
+        capture.release()
+    if decoded_frames != expected_frames:
+        raise RuntimeError(
+            f"staged video verification failed for {stream_name}: decoded "
+            f"{decoded_frames} of {expected_frames} expected frames"
+        )
+
+
+def extract_video_stream(stream, output_dir, name=None, output_stem=None):
     """Extract a video stream while preserving 1:1 timestamp row alignment."""
     stream_name = name or stream['info']['name'][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting video stream: {stream_name}")
 
-    output_file = os.path.join(output_dir, f"{stream_name}.mp4")
-    partial_file = os.path.join(output_dir, f".{stream_name}.partial.mp4")
+    output_file = os.path.join(output_dir, f"{stem}.mp4")
+    partial_file = os.path.join(output_dir, f".{stem}.partial.mp4")
+    timestamp_file = os.path.join(output_dir, f"{stem}_timestamps.csv")
+    partial_timestamp_file = os.path.join(
+        output_dir,
+        f".{stem}_timestamps.partial.csv",
+    )
+    if os.path.lexists(output_file) or os.path.lexists(timestamp_file):
+        raise RuntimeError(
+            f"video output already exists for {stream_name}; use an empty "
+            "extraction directory"
+        )
     timestamps = stream['time_stamps']
     frames_data = stream['time_series']
 
@@ -322,21 +646,12 @@ def extract_video_stream(stream, output_dir, name=None):
             f"{len(frames_data)} frames and {len(timestamps)} timestamps"
         )
 
-    try:
-        timestamp_values = np.asarray(timestamps, dtype=np.float64)
-    except (TypeError, ValueError) as error:
-        raise RuntimeError(
-            f"video timestamps are not numeric for {stream_name}"
-        ) from error
-    if not np.all(np.isfinite(timestamp_values)):
-        raise RuntimeError(
-            f"video timestamps are not finite for {stream_name}"
-        )
+    timestamp_values = _validated_lsl_timestamps(
+        timestamps,
+        len(frames_data),
+        stream_name,
+    )
     frame_intervals = np.diff(timestamp_values)
-    if len(frame_intervals) and np.any(frame_intervals <= 0):
-        raise RuntimeError(
-            f"video timestamps are not strictly increasing for {stream_name}"
-        )
     avg_interval = np.mean(frame_intervals) if len(frame_intervals) > 0 else 1 / 30
     fps = 1.0 / avg_interval if avg_interval > 0 else 30
     print(f"Estimated frame rate: {fps:.2f} FPS")
@@ -372,27 +687,63 @@ def extract_video_stream(stream, output_dir, name=None):
         except FileNotFoundError:
             pass
         raise
-    video_writer.release()
-    os.replace(partial_file, output_file)
+    else:
+        video_writer.release()
 
-    timestamp_file = os.path.join(output_dir, f"{stream_name}_timestamps.csv")
     timestamp_df = pd.DataFrame({
         'frame_index': range(len(timestamp_values)),
         'timestamp': timestamp_values,
         'timestamp_domain': ['lsl'] * len(timestamp_values),
     })
-    timestamp_df.to_csv(timestamp_file, index=False)
+    committed_video = False
+    try:
+        _verify_video_file(
+            partial_file,
+            len(frames_data),
+            (width, height),
+            stream_name,
+        )
+        timestamp_df.to_csv(partial_timestamp_file, index=False)
+        os.replace(partial_file, output_file)
+        committed_video = True
+        os.replace(partial_timestamp_file, timestamp_file)
+    except Exception:
+        if committed_video:
+            try:
+                os.remove(output_file)
+            except FileNotFoundError:
+                pass
+        try:
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.remove(partial_timestamp_file)
+        except FileNotFoundError:
+            pass
+        raise
 
     print(f"Video saved to: {output_file}")
     print(f"Timestamps saved to: {timestamp_file}")
 
-def extract_audio_stream(stream, output_dir, name=None):
+def extract_audio_stream(stream, output_dir, name=None, output_stem=None):
     """Extract one sample-aligned LSL audio stream to WAV and timestamps."""
     stream_name = name or stream['info']['name'][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting audio stream: {stream_name}")
 
-    output_file = os.path.join(output_dir, f"{stream_name}.wav")
-    partial_file = os.path.join(output_dir, f".{stream_name}.partial.wav")
+    output_file = os.path.join(output_dir, f"{stem}.wav")
+    partial_file = os.path.join(output_dir, f".{stem}.partial.wav")
+    timestamp_file = os.path.join(output_dir, f"{stem}_timestamps.csv")
+    partial_timestamp_file = os.path.join(
+        output_dir,
+        f".{stem}_timestamps.partial.csv",
+    )
+    if os.path.lexists(output_file) or os.path.lexists(timestamp_file):
+        raise RuntimeError(
+            f"audio output already exists for {stream_name}; use an empty "
+            "extraction directory"
+        )
     timestamps = np.asarray(stream['time_stamps'], dtype=np.float64)
     audio_data = stream['time_series']
 
@@ -452,16 +803,22 @@ def extract_audio_stream(stream, output_dir, name=None):
 
         print(f"Audio array shape: {audio_array.shape}")
         sf.write(partial_file, audio_array, sample_rate)
-        os.replace(partial_file, output_file)
-        print(f"Audio saved to: {output_file}")
-
-        timestamp_file = os.path.join(output_dir, f"{stream_name}_timestamps.csv")
         timestamp_df = pd.DataFrame({
             'sample_index': range(len(timestamps)),
             'timestamp': timestamps,
             'timestamp_domain': ['lsl'] * len(timestamps),
         })
-        timestamp_df.to_csv(timestamp_file, index=False)
+        timestamp_df.to_csv(partial_timestamp_file, index=False)
+        os.replace(partial_file, output_file)
+        try:
+            os.replace(partial_timestamp_file, timestamp_file)
+        except Exception:
+            try:
+                os.remove(output_file)
+            except FileNotFoundError:
+                pass
+            raise
+        print(f"Audio saved to: {output_file}")
         print(f"Timestamps saved to: {timestamp_file}")
         return output_file
     except Exception:
@@ -469,221 +826,172 @@ def extract_audio_stream(stream, output_dir, name=None):
             os.remove(partial_file)
         except FileNotFoundError:
             pass
-        raise
-
-def extract_gaze_stream(stream, output_dir, name=None):
-    """Extract a gaze stream from XDF to CSV with support for both API and LSL formats"""
-    stream_name = name or stream['info']['name'][0]
-    print(f"Extracting gaze stream: {stream_name}")
-    
-    # Create output CSV file
-    output_file = os.path.join(output_dir, f"{stream_name}.csv")
-    
-    # Extract timestamps and gaze data
-    timestamps = stream['time_stamps']
-    gaze_data = stream['time_series']
-    
-    # Properly check if data exists and has elements
-    if gaze_data is None or len(gaze_data) == 0:
-        print(f"No data found in gaze stream: {stream_name}")
-        return
-    
-    # Print basic info about the data
-    print(f"Gaze data type: {type(gaze_data)}")
-    print(f"Gaze data shape: {gaze_data.shape if hasattr(gaze_data, 'shape') else 'unknown'}")
-    print(f"First sample type: {type(gaze_data[0]) if len(gaze_data) > 0 else 'N/A'}")
-    
-    # Convert to proper array if needed
-    if not isinstance(gaze_data, np.ndarray):
         try:
-            gaze_data = np.array(gaze_data)
-            print(f"Converted gaze data to numpy array with shape: {gaze_data.shape}")
-        except Exception as e:
-            print(f"Error converting gaze data to numpy array: {e}")
-            
-            # Fallback: Save what we can
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'sample_count': len(gaze_data)
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            return
-    
-    # Get channel count
-    channel_count = int(stream['info']['channel_count'][0])
-    print(f"Channel count from stream info: {channel_count}")
-    
-    # Determine format based on channel count
-    if channel_count == 16:
-        # This is the extended LSL format with 16 channels
-        print("Detected 16-channel LSL format gaze data")
-        column_names = [
-            "x", "y", 
-            "left_PupilDiameter", "left_EyeballCenterX", "left_EyeballCenterY", "left_EyeballCenterZ",
-            "left_OpticalAxisX", "left_OpticalAxisY", "right_OpticalAxisZ", "right_PupilDiameter",
-            "right_EyeballCenterX", "right_EyeballCenterY", "right_EyeballCenterZ",
-            "right_OpticalAxisX", "right_OpticalAxisY", "right_OpticalAxisZ"
-        ]
-        format_type = "LSL"
-    elif channel_count <= 5:
-        # This is API format
-        print("Detected API format gaze data")
-        column_names = ["frame_index", "gaze_x", "gaze_y", "pupil_diameter_left", "pupil_diameter_right"]
-        
-        # Use only as many columns as we have in the data
-        if len(gaze_data.shape) > 1:
-            column_names = column_names[:gaze_data.shape[1]]
-            # If we have more columns than expected, add generic names
-            if gaze_data.shape[1] > len(column_names):
-                column_names.extend([f"extra_{i}" for i in range(len(column_names), gaze_data.shape[1])])
-        format_type = "API"
-    else:
-        # Generic handling for other channel counts
-        print(f"Unknown gaze format with {channel_count} channels")
-        column_names = [f"channel_{i}" for i in range(gaze_data.shape[1] if len(gaze_data.shape) > 1 else 1)]
-        format_type = "UNKNOWN"
-    
-    # Create DataFrame with error handling
-    try:
-        # Make sure column counts match
-        if len(gaze_data.shape) > 1 and gaze_data.shape[1] != len(column_names):
-            print(f"Warning: Column count mismatch. Data has {gaze_data.shape[1]} columns, but {len(column_names)} column names.")
-            # Adjust column names to match data shape
-            if gaze_data.shape[1] < len(column_names):
-                column_names = column_names[:gaze_data.shape[1]]
-            else:
-                column_names.extend([f"extra_{i}" for i in range(len(column_names), gaze_data.shape[1])])
-        
-        # Create DataFrame
-        if len(gaze_data.shape) > 1:
-            # Multi-column data
-            df = pd.DataFrame(gaze_data, columns=column_names)
-        else:
-            # Single-column data
-            df = pd.DataFrame({column_names[0]: gaze_data})
-            
-        # Reset frame_index for API format
-        if format_type == "API" and 'frame_index' in df.columns:
-            if not pd.isna(df['frame_index']).all():  # Make sure frame_index column has valid data
-                # Reset frame index to start from 0
-                if len(df) > 0 and not pd.isna(df['frame_index'].iloc[0]):
-                    first_frame = df['frame_index'].iloc[0]
-                    df['original_frame_index'] = df['frame_index'].copy()  # Preserve original
-                    df['frame_index'] = df['frame_index'] - first_frame
-                    print(f"Reset frame_index to start at 0 (original first frame: {first_frame})")
-        
-        timestamp_values = np.asarray(timestamps, dtype=np.float64)
-        if len(timestamp_values) != len(df):
-            raise RuntimeError(
-                f"gaze timestamp/sample mismatch for {stream_name}: "
-                f"{len(timestamp_values)} timestamps for {len(df)} samples"
-            )
-        if not np.all(np.isfinite(timestamp_values)):
-            raise RuntimeError(f"gaze contains non-finite timestamps: {stream_name}")
-        df['timestamp'] = timestamp_values
-        df['timestamp_domain'] = 'lsl'
-        df['format_type'] = format_type
-        
-        # Add data_type for LSL format
-        if format_type == "LSL":
-            df['data_type'] = 'GAZE'
-
-        # Add empty event_value column for LSL format
-        if format_type == "LSL":
-            df['event_value'] = ''
-        
-        # Save to CSV
-        df.to_csv(output_file, index=False)
-        print(f"Gaze data saved to: {output_file}")
-        print(f"Gaze format identified as: {format_type}")
-        
-    except Exception:
-        try:
-            os.remove(output_file)
+            os.remove(partial_timestamp_file)
         except FileNotFoundError:
             pass
         raise
 
-def extract_metadata_stream(stream, output_dir, name=None):
+def extract_gaze_stream(stream, output_dir, name=None, output_stem=None):
+    """Extract a declared gaze stream without guessing or changing its data."""
+
+    stream_name = name or stream["info"]["name"][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
+    print(f"Extracting gaze stream: {stream_name}")
+    gaze_data, timestamps, labels = _validated_numeric_stream(
+        stream,
+        stream_name,
+    )
+    reserved = {"timestamp", "timestamp_domain"}
+    if reserved & set(labels):
+        raise RuntimeError(
+            f"gaze channel labels conflict with extraction metadata: {stream_name}"
+        )
+    dataframe = pd.DataFrame(gaze_data, columns=labels)
+    dataframe["timestamp"] = timestamps
+    dataframe["timestamp_domain"] = "lsl"
+    output_file = os.path.join(output_dir, f"{stem}.csv")
+    _write_dataframe_atomic(dataframe, output_file)
+    print(f"Gaze data saved to: {output_file}")
+    return output_file
+
+def extract_metadata_stream(stream, output_dir, name=None, output_stem=None):
     """Extract a metadata stream from XDF to JSON"""
     stream_name = name or stream['info']['name'][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting metadata stream: {stream_name}")
     
     # Create output JSON file
-    output_file = os.path.join(output_dir, f"{stream_name}.json")
+    output_file = os.path.join(output_dir, f"{stem}.json")
     
     # Extract timestamps and metadata
     timestamps = stream['time_stamps']
     metadata_entries = stream['time_series']
     
     if metadata_entries is None or len(metadata_entries) == 0:
-        print(f"No data found in metadata stream: {stream_name}")
-        return
+        raise RuntimeError(f"no metadata samples found in stream: {stream_name}")
+    timestamp_values = _validated_lsl_timestamps(
+        timestamps,
+        len(metadata_entries),
+        stream_name,
+    )
     
     # Process metadata with progress bar
     metadata_list = []
     for i, entry in enumerate(tqdm(metadata_entries, desc="Processing metadata")):
-        try:
-            # Get the actual entry
-            if isinstance(entry, np.ndarray) and entry.size > 0:
-                entry_data = entry[0]
-            elif isinstance(entry, list) and len(entry) > 0:
-                entry_data = entry[0]
-            else:
-                entry_data = entry
-            
-            # Metadata is usually stored as JSON string
-            if isinstance(entry_data, str):
-                try:
-                    metadata = json.loads(entry_data)
-                except json.JSONDecodeError:
-                    # Not JSON, use as is
-                    metadata = entry_data
-            else:
+        if isinstance(entry, np.ndarray):
+            if entry.size != 1:
+                raise RuntimeError(
+                    f"metadata sample {i} in {stream_name} must have one channel"
+                )
+            entry_data = entry.reshape(-1)[0]
+        elif isinstance(entry, list):
+            if len(entry) != 1:
+                raise RuntimeError(
+                    f"metadata sample {i} in {stream_name} must have one channel"
+                )
+            entry_data = entry[0]
+        else:
+            entry_data = entry
+
+        if isinstance(entry_data, str):
+            try:
+                metadata = json.loads(entry_data)
+            except json.JSONDecodeError:
                 metadata = entry_data
-                
-            # Add timestamp
-            metadata_with_time = {
-                'timestamp': timestamps[i],
-                'datetime': datetime.fromtimestamp(timestamps[i]).strftime('%Y-%m-%d %H:%M:%S.%f'),
-                'metadata': metadata
+        else:
+            metadata = entry_data
+
+        metadata_list.append(
+            {
+                "timestamp": timestamp_values[i],
+                "timestamp_domain": "lsl",
+                "metadata": metadata,
             }
-            
-            metadata_list.append(metadata_with_time)
-            
-        except Exception as e:
-            print(f"Error processing metadata entry {i}: {e}")
+        )
     
     # Save to JSON file
-    with open(output_file, 'w') as f:
-        json.dump(metadata_list, f, indent=2)
+    partial_file = os.path.join(output_dir, f".{stem}.partial.json")
+    try:
+        with open(partial_file, "w", encoding="utf-8") as file_handle:
+            json.dump(metadata_list, file_handle, indent=2)
+            file_handle.write("\n")
+        os.replace(partial_file, output_file)
+    except Exception:
+        try:
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        raise
     
     print(f"Metadata saved to: {output_file}")
+
+def _decode_lsl_depth_frame(frame_data, frame_index, stream_name):
+    """Decode one raw uint16 depth PNG or fail without skipping the frame."""
+
+    try:
+        if isinstance(frame_data, np.ndarray):
+            if frame_data.size == 0:
+                raise ValueError("empty frame sample")
+            frame_str = frame_data.reshape(-1)[0]
+        elif isinstance(frame_data, list):
+            if not frame_data:
+                raise ValueError("empty frame sample")
+            frame_str = frame_data[0]
+        else:
+            frame_str = frame_data
+        png_data = base64.b64decode(frame_str, validate=True)
+        raw_depth = cv2.imdecode(
+            np.frombuffer(png_data, np.uint8),
+            cv2.IMREAD_UNCHANGED,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"could not decode depth frame {frame_index} from "
+            f"{stream_name}: {error}"
+        ) from error
+    if raw_depth is None or raw_depth.size == 0:
+        raise RuntimeError(
+            f"could not decode depth frame {frame_index} from {stream_name}"
+        )
+    if raw_depth.ndim != 2 or raw_depth.dtype != np.uint16:
+        raise RuntimeError(
+            f"depth frame {frame_index} from {stream_name} is "
+            f"{raw_depth.dtype} with shape {raw_depth.shape!r}; expected one "
+            "uint16 channel of raw device values"
+        )
+    return raw_depth
+
 
 def extract_depth_stream(
     stream,
     output_dir,
     name=None,
+    output_stem=None,
     save_interval=30,
     include_csv=False,
     depth_scale_m_per_unit=None,
     depth_scale_source=None,
 ):
-    """Extract raw depth plus metric derivatives using a recorded sensor scale."""
-    stream_name = name or stream['info']['name'][0]
+    """Transactionally extract raw depth and verified metric derivatives."""
+
+    stream_name = name or stream["info"]["name"][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting depth stream: {stream_name}")
 
-    # Extract timestamps and frame data
-    timestamps = stream['time_stamps']
-    frames_data = stream['time_series']
+    timestamps = stream["time_stamps"]
+    frames_data = stream["time_series"]
 
     if frames_data is None or len(frames_data) == 0:
-        print(f"No data found in depth stream: {stream_name}")
-        return
+        raise RuntimeError(f"no depth frames found in stream: {stream_name}")
     if save_interval <= 0:
         raise ValueError("depth save interval must be a positive integer")
+    timestamp_values = _validated_lsl_timestamps(
+        timestamps,
+        len(frames_data),
+        stream_name,
+    )
+    frame_intervals = np.diff(timestamp_values)
 
     if depth_scale_m_per_unit is None:
         depth_scale, resolved_source = _resolve_depth_scale(stream, [stream])
@@ -700,196 +1008,203 @@ def extract_depth_stream(
         f"(source: {depth_scale_source})"
     )
 
-    # Create outputs only after metric conversion has been established.
-    depth_dir = os.path.join(output_dir, f"{stream_name}_depth")
-    os.makedirs(depth_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"{stream_name}_visualization.mp4")
-
-    # Determine frame rate from timestamps
-    frame_intervals = np.diff(timestamps)
     avg_interval = np.mean(frame_intervals) if len(frame_intervals) > 0 else 1/30
     fps = 1.0 / avg_interval if avg_interval > 0 else 30
     print(f"Estimated frame rate: {fps:.2f} FPS")
 
-    # Process frames - first pass to get statistics and first frame
+    first_raw_depth = _decode_lsl_depth_frame(
+        frames_data[0],
+        0,
+        stream_name,
+    )
+
     depth_min_global = float('inf')
     depth_max_global = 0
     valid_depths = []
-    
-    # Find a good frame and collect statistics
-    first_raw_depth = None
-    for frame_index in range(min(10, len(frames_data))):
-        try:
-            frame_data = frames_data[frame_index]
-            # Get the frame string
-            if isinstance(frame_data, np.ndarray) and frame_data.size > 0:
-                frame_str = frame_data[0]
-            elif isinstance(frame_data, list) and len(frame_data) > 0:
-                frame_str = frame_data[0]
-            else:
-                frame_str = frame_data
-                
-            # Decode the depth data
-            png_data = base64.b64decode(frame_str)
-            nparr = np.frombuffer(png_data, np.uint8)
-            raw_depth = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
-            
-            if raw_depth is not None and raw_depth.size > 0:
-                first_raw_depth = raw_depth
-                
-                # Collect depth statistics
-                valid_mask = raw_depth > 0
-                if np.any(valid_mask):
-                    depth_min = np.min(raw_depth[valid_mask])
-                    depth_max = np.max(raw_depth[valid_mask])
-                    depth_min_global = min(depth_min_global, depth_min)
-                    depth_max_global = max(depth_max_global, depth_max)
-                    
-                    # Sample some valid depths for percentiles
-                    sample_size = min(10000, np.count_nonzero(valid_mask))
-                    if sample_size > 0:
-                        # Get random indices of valid pixels
-                        valid_indices = np.where(valid_mask.flatten())[0]
-                        sampled_indices = np.random.choice(valid_indices, sample_size, replace=False)
-                        valid_depths.extend(raw_depth.flatten()[sampled_indices])
-                break
-        except Exception as e:
-            print(f"Error processing frame {frame_index}: {e}")
-    
-    if first_raw_depth is None:
-        print(f"Could not extract any valid depth frames from {stream_name}")
-        return
-    
-    # Determine visualization range from collected statistics
+    valid_mask = first_raw_depth > 0
+    if np.any(valid_mask):
+        depth_min_global = np.min(first_raw_depth[valid_mask])
+        depth_max_global = np.max(first_raw_depth[valid_mask])
+        sample_size = min(10000, np.count_nonzero(valid_mask))
+        valid_indices = np.where(valid_mask.flatten())[0]
+        sampled_indices = np.random.choice(
+            valid_indices,
+            sample_size,
+            replace=False,
+        )
+        valid_depths.extend(first_raw_depth.flatten()[sampled_indices])
+
     if valid_depths:
         valid_depths = np.array(valid_depths)
         p_low = np.percentile(valid_depths, 1)
         p_high = np.percentile(valid_depths, 99)
-        
-        # Use slightly expanded range for better visualization
         range_expand = (p_high - p_low) * 0.1
         vis_min = max(0, p_low - range_expand)
         vis_max = min(65535, p_high + range_expand)
-        
         print(f"Using depth range for visualization: {vis_min:.1f}-{vis_max:.1f}")
-        print(f"This corresponds to approximately {vis_min*depth_scale:.3f}m - {vis_max*depth_scale:.3f}m")
+        print(
+            "This corresponds to approximately "
+            f"{vis_min * depth_scale:.3f}m - {vis_max * depth_scale:.3f}m"
+        )
     else:
-        # Fallback to simple min/max if no valid depths collected
         vis_min = depth_min_global if depth_min_global != float('inf') else 0
         vis_max = depth_max_global if depth_max_global != 0 else 10000
         print(f"Fallback depth range: {vis_min}-{vis_max}")
-    
-    # Get frame dimensions for video
+
     height, width = first_raw_depth.shape[:2]
     print(f"Frame dimensions: {width}x{height}")
-    
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
-    
-    # Process all frames with improved normalization
+
+    depth_dir_name = f"{stem}_depth"
+    visualization_name = f"{stem}_visualization.mp4"
+    timestamp_name = f"{stem}_timestamps.csv"
+    metadata_name = f"{stem}_depth_metadata.json"
+    managed_outputs = (
+        depth_dir_name,
+        visualization_name,
+        timestamp_name,
+        metadata_name,
+    )
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    if os.path.lexists(output_dir):
+        if os.path.islink(output_dir) or not os.path.isdir(output_dir):
+            raise RuntimeError(f"depth output path is not a directory: {output_dir}")
+    else:
+        os.makedirs(output_dir)
+    staging_dir = tempfile.mkdtemp(
+        prefix=f".{stem}.depth-staging-",
+        dir=output_dir,
+    )
+    staged_depth_dir = os.path.join(staging_dir, depth_dir_name)
+    staged_visualization = os.path.join(staging_dir, visualization_name)
+    staged_timestamps = os.path.join(staging_dir, timestamp_name)
+    staged_metadata = os.path.join(staging_dir, metadata_name)
+    os.makedirs(staged_depth_dir)
+
     print(f"Processing {len(frames_data)} frames...")
     print(f"Saving raw depth PNG every {save_interval} frames")
-    
+
     frame_counter = 0
-    for i, frame_data in enumerate(tqdm(frames_data)):
+    try:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(
+            staged_visualization,
+            fourcc,
+            fps,
+            (width, height),
+        )
+        if not video_writer.isOpened():
+            video_writer.release()
+            raise RuntimeError(
+                f"could not create depth visualization for {stream_name}"
+            )
         try:
-            # Get the frame string
-            if isinstance(frame_data, np.ndarray) and frame_data.size > 0:
-                frame_str = frame_data[0]
-            elif isinstance(frame_data, list) and len(frame_data) > 0:
-                frame_str = frame_data[0]
-            else:
-                frame_str = frame_data
-                
-            # Decode base64 encoded data
-            png_data = base64.b64decode(frame_str)
-            nparr = np.frombuffer(png_data, np.uint8)
-            raw_depth = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
-            
-            if raw_depth is None:
-                print(f"Warning: Could not decode frame {i}")
-                continue
-            
-            # Create improved visualization
-            valid_mask = (raw_depth > 0)
-            
-            # Initialize black image for invalid areas
-            color_frame = np.zeros((raw_depth.shape[0], raw_depth.shape[1], 3), dtype=np.uint8)
-            
-            if np.any(valid_mask):
-                # Normalize the valid depths
-                normalized = np.zeros_like(raw_depth, dtype=np.uint8)
-                normalized[valid_mask] = np.clip(
-                    ((raw_depth[valid_mask] - vis_min) / (vis_max - vis_min) * 255),
-                    0, 255
-                ).astype(np.uint8)
-                
-                # Apply colormap only to valid pixels
-                colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
-                color_frame[valid_mask] = colored[valid_mask]
-                
-                # Add depth scale text
-                cv2.putText(
-                    color_frame,
-                    f"Range: {vis_min*depth_scale:.2f}m - {vis_max*depth_scale:.2f}m",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (255, 255, 255),
-                    2
+            for i, frame_data in enumerate(tqdm(frames_data)):
+                raw_depth = _decode_lsl_depth_frame(
+                    frame_data,
+                    i,
+                    stream_name,
                 )
-            
-            # Save raw depth data at specified interval
-            if i % save_interval == 0:
-                depth_file = os.path.join(depth_dir, f"depth_{i:06d}.png")
-                cv2.imwrite(depth_file, raw_depth)
-                frame_counter += 1
-                
-                # Also save distance map as CSV if requested
-                if include_csv and depth_scale != 0:
-                    distance_map = raw_depth.astype(np.float32) * depth_scale
-                    distance_file = os.path.join(depth_dir, f"distance_{i:06d}.csv")
-                    np.savetxt(distance_file, distance_map, delimiter=',')
-            
-            # Write frame to video
-            video_writer.write(color_frame)
-            
-        except Exception as e:
-            print(f"Error processing frame {i}: {e}")
-    
-    # Release video writer
-    video_writer.release()
-    
-    # Create a CSV with timestamps
-    timestamp_file = os.path.join(output_dir, f"{stream_name}_timestamps.csv")
-    timestamp_df = pd.DataFrame({
-        'frame_index': range(len(timestamps)),
-        'timestamp': timestamps,
-        'datetime': [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
-    })
-    timestamp_df.to_csv(timestamp_file, index=False)
-    
+                if raw_depth.shape != first_raw_depth.shape:
+                    raise RuntimeError(
+                        f"depth frame size changed at frame {i} in "
+                        f"{stream_name}: {raw_depth.shape!r} != "
+                        f"{first_raw_depth.shape!r}"
+                    )
+
+                valid_mask = raw_depth > 0
+                color_frame = np.zeros(
+                    (raw_depth.shape[0], raw_depth.shape[1], 3),
+                    dtype=np.uint8,
+                )
+                if np.any(valid_mask):
+                    normalized = np.zeros_like(raw_depth, dtype=np.uint8)
+                    visualization_span = max(float(vis_max - vis_min), 1.0)
+                    normalized[valid_mask] = np.clip(
+                        (
+                            (raw_depth[valid_mask] - vis_min)
+                            / visualization_span
+                            * 255
+                        ),
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                    colored = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
+                    color_frame[valid_mask] = colored[valid_mask]
+                    cv2.putText(
+                        color_frame,
+                        (
+                            f"Range: {vis_min * depth_scale:.2f}m - "
+                            f"{vis_max * depth_scale:.2f}m"
+                        ),
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 255, 255),
+                        2,
+                    )
+
+                if i % save_interval == 0:
+                    depth_file = os.path.join(
+                        staged_depth_dir,
+                        f"depth_{i:06d}.png",
+                    )
+                    if not cv2.imwrite(depth_file, raw_depth):
+                        raise RuntimeError(
+                            f"could not write raw depth frame {i} for "
+                            f"{stream_name}"
+                        )
+                    frame_counter += 1
+                    if include_csv:
+                        distance_map = raw_depth.astype(np.float32) * depth_scale
+                        distance_file = os.path.join(
+                            staged_depth_dir,
+                            f"distance_{i:06d}.csv",
+                        )
+                        np.savetxt(distance_file, distance_map, delimiter=',')
+
+                video_writer.write(color_frame)
+        finally:
+            video_writer.release()
+
+        _verify_video_file(
+            staged_visualization,
+            len(frames_data),
+            (width, height),
+            stream_name,
+        )
+        timestamp_df = pd.DataFrame({
+            'frame_index': range(len(timestamp_values)),
+            'timestamp': timestamp_values,
+            'timestamp_domain': ['lsl'] * len(timestamp_values),
+        })
+        timestamp_df.to_csv(staged_timestamps, index=False)
+        depth_metadata = {
+            "stream_name": stream_name,
+            "output_stem": stem,
+            "raw_encoding": f"{first_raw_depth.dtype} PNG",
+            "raw_value_unit": "device_depth_unit",
+            "depth_scale_m_per_unit": depth_scale,
+            "depth_scale_source": depth_scale_source,
+            "metric_distance_unit": "metre",
+            "distance_csv_unit": "metre" if include_csv else None,
+        }
+        with open(staged_metadata, "w", encoding="utf-8") as file_handle:
+            json.dump(depth_metadata, file_handle, indent=2)
+            file_handle.write("\n")
+        _publish_staged_outputs(staging_dir, output_dir, managed_outputs)
+    except Exception:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
+    else:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    depth_dir = os.path.join(output_dir, depth_dir_name)
+    output_file = os.path.join(output_dir, visualization_name)
+    timestamp_file = os.path.join(output_dir, timestamp_name)
+    depth_metadata_file = os.path.join(output_dir, metadata_name)
     print(f"Depth visualization saved to: {output_file}")
     print(f"Raw depth samples ({frame_counter} frames) saved to: {depth_dir}")
     print(f"Timestamps saved to: {timestamp_file}")
-    depth_metadata_file = os.path.join(
-        output_dir,
-        f"{stream_name}_depth_metadata.json",
-    )
-    depth_metadata = {
-        "stream_name": stream_name,
-        "raw_encoding": f"{first_raw_depth.dtype} PNG",
-        "raw_value_unit": "device_depth_unit",
-        "depth_scale_m_per_unit": depth_scale,
-        "depth_scale_source": depth_scale_source,
-        "metric_distance_unit": "metre",
-        "distance_csv_unit": "metre" if include_csv else None,
-    }
-    with open(depth_metadata_file, "w", encoding="utf-8") as file_handle:
-        json.dump(depth_metadata, file_handle, indent=2)
-        file_handle.write("\n")
-
     print(f"Depth metadata saved to: {depth_metadata_file}")
     print(
         "Raw depth PNG values are device units; multiply by "
@@ -898,119 +1213,89 @@ def extract_depth_stream(
     return depth_metadata
 
 
-def extract_generic_stream(stream, output_dir, name=None):
-    """Extract a generic stream from XDF to CSV"""
+def extract_generic_stream(stream, output_dir, name=None, output_stem=None):
+    """Extract an explicitly labelled unknown stream without type guessing."""
+
     stream_name = name or stream['info']['name'][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     stream_type = stream['info']['type'][0]
     print(f"Extracting generic stream: {stream_name} (type: {stream_type})")
-    
-    # Create output CSV file
-    output_file = os.path.join(output_dir, f"{stream_name}.csv")
-    
-    # Extract timestamps and data
-    timestamps = stream['time_stamps']
-    data_series = stream['time_series']
-    
+
+    channel_count = _declared_channel_count(stream, stream_name)
+    labels = _declared_channel_labels(stream, stream_name, channel_count)
+    if {"timestamp", "timestamp_domain"} & set(labels):
+        raise RuntimeError(
+            f"generic channel labels conflict with extraction metadata: {stream_name}"
+        )
+    data_series = stream.get("time_series")
     if data_series is None or len(data_series) == 0:
-        print(f"No data found in stream: {stream_name}")
-        return
-    
+        raise RuntimeError(f"no samples found in stream: {stream_name}")
     try:
-        # Print basic info about the data
-        print(f"Data type: {type(data_series)}")
-        print(f"First sample type: {type(data_series[0]) if len(data_series) > 0 else 'N/A'}")
-        
-        # Try to process data into rows for CSV
-        rows = []
-        
-        # Process data
-        for i, data in enumerate(data_series):
-            try:
-                # Create a row for this sample
-                row = {'timestamp': timestamps[i]}
-                
-                # Extract the data values
-                if isinstance(data, np.ndarray):
-                    if data.size == 1:
-                        # Single value
-                        row['value'] = float(data)
-                    else:
-                        # Multiple values
-                        for j, value in enumerate(data.flatten()):
-                            row[f'channel_{j}'] = value
-                elif isinstance(data, list):
-                    # List of values
-                    if len(data) == 1:
-                        # Single value in a list
-                        row['value'] = data[0]
-                    else:
-                        # Multiple values
-                        for j, value in enumerate(data):
-                            row[f'channel_{j}'] = value
-                else:
-                    # Single value
-                    row['value'] = data
-                
-                rows.append(row)
-            except Exception as e:
-                print(f"Error processing row {i}: {e}")
-        
-        # Create DataFrame
-        df = pd.DataFrame(rows)
-        
-        # Add datetime column
-        df['datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in df['timestamp']]
-        
-        # Save to CSV
-        df.to_csv(output_file, index=False)
-        print(f"Data saved to: {output_file}")
-        
-    except Exception as e:
-        print(f"Error processing stream {stream_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
-        fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-        try:
-            # Try to convert to list for JSON serialization
-            data_list = []
-            for item in data_series:
-                if hasattr(item, 'tolist'):
-                    data_list.append(item.tolist())
-                elif isinstance(item, list):
-                    data_list.append(item)
-                else:
-                    data_list.append(str(item))
-                    
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'data': data_list
-                }, f)
-            print(f"Fallback: raw data saved to {fallback_file}")
-        except Exception as json_error:
-            print(f"Error saving JSON fallback: {json_error}")
+        values = np.asarray(data_series)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"samples are not rectangular for generic stream {stream_name}"
+        ) from error
+    raw_timestamps = stream.get("time_stamps")
+    timestamp_count = len(raw_timestamps) if raw_timestamps is not None else 0
+    if values.ndim == 1:
+        if channel_count == 1 and len(values) == timestamp_count:
+            values = values.reshape(-1, 1)
+        elif timestamp_count == 1 and len(values) == channel_count:
+            values = values.reshape(1, channel_count)
+    if values.ndim != 2 or values.shape[1] != channel_count:
+        raise RuntimeError(
+            f"generic stream {stream_name} must be a sample-by-channel matrix "
+            f"with {channel_count} channels; got {values.shape!r}"
+        )
+    if values.dtype.kind in "iufc" and not np.all(np.isfinite(values)):
+        raise RuntimeError(
+            f"generic numeric stream contains non-finite values: {stream_name}"
+        )
+    if values.dtype.kind == "O":
+        for value in values.reshape(-1):
+            if value is None or isinstance(value, (list, tuple, dict, np.ndarray)):
+                raise RuntimeError(
+                    f"generic stream contains a non-scalar value: {stream_name}"
+                )
+            if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+                raise RuntimeError(
+                    f"generic stream contains a non-finite value: {stream_name}"
+                )
+
+    timestamps = _validated_lsl_timestamps(
+        raw_timestamps,
+        len(values),
+        stream_name,
+    )
+    dataframe = pd.DataFrame(values, columns=labels)
+    dataframe["timestamp"] = timestamps
+    dataframe["timestamp_domain"] = "lsl"
+    output_file = os.path.join(output_dir, f"{stem}.csv")
+    _write_dataframe_atomic(dataframe, output_file)
+    print(f"Data saved to: {output_file}")
+    return output_file
             
-            # Last resort: save as numpy
-            try:
-                np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-                np.save(np_file, data_series)
-                np_timestamps = os.path.join(output_dir, f"{stream_name}_timestamps.npy")
-                np.save(np_timestamps, timestamps)
-                print(f"Fallback: Data saved as numpy files: {np_file} and {np_timestamps}")
-            except Exception as np_error:
-                print(f"Error saving numpy fallback: {np_error}")
-            
-def extract_imu_stream(stream, output_dir, name=None, output_filename=None):
+def extract_imu_stream(
+    stream,
+    output_dir,
+    name=None,
+    output_filename=None,
+    output_stem=None,
+):
     """Extract one validated IMU stream without changing its LSL clock."""
     stream_name = name or stream['info']['name'][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting IMU stream: {stream_name}")
 
-    # A direct/single-stream call keeps the historical ``imu.csv`` contract.
-    output_filename = output_filename or "imu.csv"
-    if os.path.basename(output_filename) != output_filename:
-        raise ValueError("IMU output filename must not contain a directory")
+    if output_filename is not None:
+        if os.path.basename(output_filename) != output_filename:
+            raise ValueError("IMU output filename must not contain a directory")
+        requested_stem, requested_extension = os.path.splitext(output_filename)
+        if requested_extension.lower() != ".csv":
+            raise ValueError("IMU output filename must end in .csv")
+        stem = _resolved_output_stem(stream_name, requested_stem)
+    output_filename = f"{stem}.csv"
     output_file = os.path.join(output_dir, output_filename)
     partial_file = os.path.join(output_dir, f".{output_filename}.partial")
 
@@ -1119,577 +1404,227 @@ def extract_imu_stream(stream, output_dir, name=None, output_filename=None):
     print(f"IMU data saved to: {output_file}")
     return output_file
 
-def extract_fixations_stream(stream, output_dir, name=None):
-    """Extract fixations data from XDF to CSV following the specified format"""
-    stream_name = name or stream['info']['name'][0]
+def extract_fixations_stream(stream, output_dir, name=None, output_stem=None):
+    """Extract declared fixation events without padding or timestamp rewriting."""
+
+    stream_name = name or stream["info"]["name"][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting fixations stream: {stream_name}")
-    
-    # Create output CSV file
-    output_file = os.path.join(output_dir, "fixations.csv")
-    
-    # Extract timestamps and fixations data
-    timestamps = stream['time_stamps']
-    fixation_data = stream['time_series']
-    
-    if fixation_data is None or len(fixation_data) == 0:
-        print(f"No data found in fixations stream: {stream_name}")
-        return
-    
-    # Print basic info about the data
-    print(f"Fixations data type: {type(fixation_data)}")
-    print(f"Fixations data shape: {fixation_data.shape if hasattr(fixation_data, 'shape') else 'unknown'}")
-    print(f"First sample type: {type(fixation_data[0]) if len(fixation_data) > 0 else 'N/A'}")
-    
-    # Convert to proper array if needed
-    if not isinstance(fixation_data, np.ndarray):
-        try:
-            fixation_data = np.array(fixation_data)
-            print(f"Converted fixations data to numpy array with shape: {fixation_data.shape}")
-        except Exception as e:
-            print(f"Error converting fixations data to numpy array: {e}")
-            
-            # Fallback: Save what we can
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'sample_count': len(fixation_data)
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            return
-    
-    # Get channel count
-    channel_count = int(stream['info']['channel_count'][0])
-    print(f"Channel count from stream info: {channel_count}")
-    
-    # Expected column names for fixation data
-    # Expected column names for fixation data
-    fixation_columns = [
-        "fixation_id", "start_time_ns", "end_time_ns", "duration_ms",
-        "mean_gaze_x", "mean_gaze_y", "azimuth_deg", "elevation_deg"
-    ]
-    
-    # Adjust column names based on actual data
-    if len(fixation_data.shape) > 1:
-        if fixation_data.shape[1] < len(fixation_columns):
-            # Use only as many columns as we have in the data
-            column_names = fixation_columns[:fixation_data.shape[1]]
-            print(f"Warning: Fixations data has fewer columns ({fixation_data.shape[1]}) than expected ({len(fixation_columns)})")
-        elif fixation_data.shape[1] > len(fixation_columns):
-            # If we have more columns than expected, add generic names
-            column_names = fixation_columns.copy()
-            column_names.extend([f"extra_{i}" for i in range(len(fixation_columns), fixation_data.shape[1])])
-            print(f"Warning: Fixations data has more columns ({fixation_data.shape[1]}) than expected ({len(fixation_columns)})")
-        else:
-            column_names = fixation_columns.copy()
-    else:
-        # Single column data (unlikely for fixations)
-        column_names = [fixation_columns[0]]
-        print("Warning: Fixations data appears to have only one column")
-    
-    try:
-        # Create DataFrame
-        if len(fixation_data.shape) > 1:
-            # Multi-column data
-            df = pd.DataFrame(fixation_data, columns=column_names)
-        else:
-            # Single-column data
-            df = pd.DataFrame({column_names[0]: fixation_data})
-        
-        # Add section_id and recording_id columns for compatibility
-        df['section_id'] = 1
-        df['recording_id'] = 1
-        
-        # Add timestamp column for when the fixation event was detected
-        df['detected_timestamp'] = timestamps
-        df['detected_datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
-        
-        # Ensure timestamp columns have correct format if they exist
-        if 'start_timestamp_ns' in df.columns:
-            # Check if timestamps look like seconds
-            if df['start_timestamp_ns'].dtype == 'float64' and df['start_timestamp_ns'].max() < 1e12:
-                print("Converting start_timestamp_ns from seconds to nanoseconds and int64")
-                df['start_timestamp_ns'] = (df['start_timestamp_ns'] * 1e9).astype(np.int64)
-            # Check if they are already large floats that should be integers
-            elif df['start_timestamp_ns'].dtype == 'float64':
-                print("Converting large float start_timestamp_ns to int64")
-                # Add handling for potential NaNs if necessary before conversion
-                # df['start_timestamp_ns'] = df['start_timestamp_ns'].fillna(-1).astype(np.int64) # Example NaN handling
-                df['start_timestamp_ns'] = df['start_timestamp_ns'].astype(np.int64)
-            # If already int64, potentially do nothing, or ensure it is int64
-            elif df['start_timestamp_ns'].dtype != 'int64':
-                df['start_timestamp_ns'] = df['start_timestamp_ns'].astype(np.int64)
+    optional_labels = {
+        "fixation_x_px",
+        "fixation_y_px",
+        "mean_gaze_x",
+        "mean_gaze_y",
+        "azimuth_deg",
+        "elevation_deg",
+    }
+    values, timestamps, labels = _validated_numeric_stream(
+        stream,
+        stream_name,
+        optional_nan_labels=optional_labels,
+    )
+    if {"timestamp", "timestamp_domain"} & set(labels):
+        raise RuntimeError(
+            f"fixation labels conflict with extraction metadata: {stream_name}"
+        )
+    dataframe = pd.DataFrame(values, columns=labels)
+    dataframe["timestamp"] = timestamps
+    dataframe["timestamp_domain"] = "lsl"
+    output_file = os.path.join(output_dir, f"{stem}.csv")
+    _write_dataframe_atomic(dataframe, output_file)
+    print(f"Fixations data saved to: {output_file}")
+    return output_file
 
+def extract_saccades_stream(stream, output_dir, name=None, output_stem=None):
+    """Extract declared saccades without padding or timestamp rewriting."""
 
-        if 'end_timestamp_ns' in df.columns:
-            # Check if timestamps look like seconds
-            if df['end_timestamp_ns'].dtype == 'float64' and df['end_timestamp_ns'].max() < 1e12:
-                print("Converting end_timestamp_ns from seconds to nanoseconds and int64")
-                df['end_timestamp_ns'] = (df['end_timestamp_ns'] * 1e9).astype(np.int64)
-            # Check if they are already large floats that should be integers
-            elif df['end_timestamp_ns'].dtype == 'float64':
-                print("Converting large float end_timestamp_ns to int64")
-                # Add handling for potential NaNs if necessary before conversion
-                # df['end_timestamp_ns'] = df['end_timestamp_ns'].fillna(-1).astype(np.int64) # Example NaN handling
-                df['end_timestamp_ns'] = df['end_timestamp_ns'].astype(np.int64)
-            # If already int64, potentially do nothing, or ensure it is int64
-            elif df['end_timestamp_ns'].dtype != 'int64':
-                df['end_timestamp_ns'] = df['end_timestamp_ns'].astype(np.int64)
-        
-        # Reorder columns to match expected format
-        ordered_cols = ['section_id', 'recording_id', 'fixation_id', 
-                         'start_timestamp [ns]', 'end_timestamp [ns]', 'duration [ms]',
-                         'fixation_x [px]', 'fixation_y [px]', 'azimuth [deg]', 'elevation [deg]']
-        
-        # Rename columns to match expected format
-        column_mapping = {
-            'start_time_ns': 'start_timestamp [ns]',
-            'end_time_ns': 'end_timestamp [ns]',
-            'duration_ms': 'duration [ms]',
-            'mean_gaze_x': 'fixation_x [px]',
-            'mean_gaze_y': 'fixation_y [px]',
-            'azimuth_deg': 'azimuth [deg]',
-            'elevation_deg': 'elevation [deg]'
-        }
-        
-        # Apply column renaming
-        for old_name, new_name in column_mapping.items():
-            if old_name in df.columns:
-                df.rename(columns={old_name: new_name}, inplace=True)
-        
-        # Ensure all required columns exist
-        for col in ordered_cols:
-            if col not in df.columns:
-                # For missing columns, add with NaN values
-                print(f"Warning: Adding missing column {col} with NaN values")
-                df[col] = np.nan
-        
-        # Save to CSV with ordered columns
-        final_cols = ordered_cols + ['detected_timestamp', 'detected_datetime']
-        final_df = df[final_cols]
-        final_df.to_csv(output_file, index=False)
-        print(f"Fixations data saved to: {output_file}")
-        
-    except Exception as e:
-        print(f"Error creating DataFrame: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
-        try:
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                # Convert numpy arrays to lists for JSON serialization
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'data_shape': fixation_data.shape,
-                    'data_sample': fixation_data[0].tolist() if len(fixation_data) > 0 else []
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            
-            # Also try to save as numpy file
-            np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-            np.save(np_file, fixation_data)
-            np_timestamps = os.path.join(output_dir, f"{stream_name}_timestamps.npy")
-            np.save(np_timestamps, timestamps)
-            print(f"Fallback: Data saved as numpy files: {np_file} and {np_timestamps}")
-        except Exception as fallback_error:
-            print(f"Fallback save also failed: {fallback_error}")
-
-def extract_saccades_stream(stream, output_dir, name=None):
-    """Extract saccades data from XDF to CSV following the specified format"""
-    stream_name = name or stream['info']['name'][0]
+    stream_name = name or stream["info"]["name"][0]
+    stem = _resolved_output_stem(stream_name, output_stem)
     print(f"Extracting saccades stream: {stream_name}")
-    
-    # Create output CSV file
-    output_file = os.path.join(output_dir, "saccades.csv")
-    
-    # Extract timestamps and saccades data
-    timestamps = stream['time_stamps']
-    saccade_data = stream['time_series']
-    
-    if saccade_data is None or len(saccade_data) == 0:
-        print(f"No data found in saccades stream: {stream_name}")
-        return
-    
-    # Print basic info about the data
-    print(f"Saccades data type: {type(saccade_data)}")
-    print(f"Saccades data shape: {saccade_data.shape if hasattr(saccade_data, 'shape') else 'unknown'}")
-    print(f"First sample type: {type(saccade_data[0]) if len(saccade_data) > 0 else 'N/A'}")
-    
-    # Convert to proper array if needed
-    if not isinstance(saccade_data, np.ndarray):
-        try:
-            saccade_data = np.array(saccade_data)
-            print(f"Converted saccades data to numpy array with shape: {saccade_data.shape}")
-        except Exception as e:
-            print(f"Error converting saccades data to numpy array: {e}")
-            
-            # Fallback: Save what we can
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'sample_count': len(saccade_data)
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            return
-    
-    # Get channel count
-    channel_count = int(stream['info']['channel_count'][0])
-    print(f"Channel count from stream info: {channel_count}")
-    
-    # Expected column names for saccade data
-    saccade_columns = [
-        "saccade_id", "start_time_ns", "end_time_ns", "amplitude_angle_deg",
-        "amplitude_pixels", "mean_velocity", "max_velocity", "duration_ms"
-    ]
-    
-    # Adjust column names based on actual data
-    if len(saccade_data.shape) > 1:
-        if saccade_data.shape[1] < len(saccade_columns):
-            # Use only as many columns as we have in the data
-            column_names = saccade_columns[:saccade_data.shape[1]]
-            print(f"Warning: Saccades data has fewer columns ({saccade_data.shape[1]}) than expected ({len(saccade_columns)})")
-        elif saccade_data.shape[1] > len(saccade_columns):
-            # If we have more columns than expected, add generic names
-            column_names = saccade_columns.copy()
-            column_names.extend([f"extra_{i}" for i in range(len(saccade_columns), saccade_data.shape[1])])
-            print(f"Warning: Saccades data has more columns ({saccade_data.shape[1]}) than expected ({len(saccade_columns)})")
-        else:
-            column_names = saccade_columns.copy()
-    else:
-        # Single column data (unlikely for saccades)
-        column_names = [saccade_columns[0]]
-        print("Warning: Saccades data appears to have only one column")
-    
-    try:
-        # Create DataFrame
-        if len(saccade_data.shape) > 1:
-            # Multi-column data
-            df = pd.DataFrame(saccade_data, columns=column_names)
-        else:
-            # Single-column data
-            df = pd.DataFrame({column_names[0]: saccade_data})
-        
-        # Add section_id and recording_id columns for compatibility
-        df['section_id'] = 1
-        df['recording_id'] = 1
-        
-        # Add timestamp column for when the saccade event was detected
-        df['detected_timestamp'] = timestamps
-        df['detected_datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
-        
-        # Ensure timestamp columns have correct format if they exist
-        if 'start_timestamp_ns' in df.columns:
-            # Check if timestamps look like seconds
-            if df['start_timestamp_ns'].dtype == 'float64' and df['start_timestamp_ns'].max() < 1e12:
-                print("Converting start_timestamp_ns from seconds to nanoseconds and int64")
-                df['start_timestamp_ns'] = (df['start_timestamp_ns'] * 1e9).astype(np.int64)
-            # Check if they are already large floats that should be integers
-            elif df['start_timestamp_ns'].dtype == 'float64':
-                print("Converting large float start_timestamp_ns to int64")
-                # Add handling for potential NaNs if necessary before conversion
-                # df['start_timestamp_ns'] = df['start_timestamp_ns'].fillna(-1).astype(np.int64) # Example NaN handling
-                df['start_timestamp_ns'] = df['start_timestamp_ns'].astype(np.int64)
-            # If already int64, potentially do nothing, or ensure it is int64
-            elif df['start_timestamp_ns'].dtype != 'int64':
-                df['start_timestamp_ns'] = df['start_timestamp_ns'].astype(np.int64)
+    optional_labels = {
+        "amplitude_deg",
+        "amplitude_px",
+        "amplitude_angle_deg",
+        "amplitude_pixels",
+        "mean_velocity_px_s",
+        "peak_velocity_px_s",
+        "mean_velocity",
+        "max_velocity",
+    }
+    values, timestamps, labels = _validated_numeric_stream(
+        stream,
+        stream_name,
+        optional_nan_labels=optional_labels,
+    )
+    if {"timestamp", "timestamp_domain"} & set(labels):
+        raise RuntimeError(
+            f"saccade labels conflict with extraction metadata: {stream_name}"
+        )
+    dataframe = pd.DataFrame(values, columns=labels)
+    dataframe["timestamp"] = timestamps
+    dataframe["timestamp_domain"] = "lsl"
+    output_file = os.path.join(output_dir, f"{stem}.csv")
+    _write_dataframe_atomic(dataframe, output_file)
+    print(f"Saccades data saved to: {output_file}")
+    return output_file
 
+def extract_streams(
+    xdf_file,
+    output_dir,
+    keep_raw_depth=True,
+    depth_interval=30,
+    include_csv=False,
+):
+    """Extract an XDF file transactionally into a new or empty directory."""
 
-        if 'end_timestamp_ns' in df.columns:
-            # Check if timestamps look like seconds
-            if df['end_timestamp_ns'].dtype == 'float64' and df['end_timestamp_ns'].max() < 1e12:
-                print("Converting end_timestamp_ns from seconds to nanoseconds and int64")
-                df['end_timestamp_ns'] = (df['end_timestamp_ns'] * 1e9).astype(np.int64)
-            # Check if they are already large floats that should be integers
-            elif df['end_timestamp_ns'].dtype == 'float64':
-                print("Converting large float end_timestamp_ns to int64")
-                # Add handling for potential NaNs if necessary before conversion
-                # df['end_timestamp_ns'] = df['end_timestamp_ns'].fillna(-1).astype(np.int64) # Example NaN handling
-                df['end_timestamp_ns'] = df['end_timestamp_ns'].astype(np.int64)
-            # If already int64, potentially do nothing, or ensure it is int64
-            elif df['end_timestamp_ns'].dtype != 'int64':
-                df['end_timestamp_ns'] = df['end_timestamp_ns'].astype(np.int64)
-        
-        # Reorder columns to match expected format
-        ordered_cols = ['section_id', 'recording_id', 'saccade_id', 
-                         'start_timestamp [ns]', 'end_timestamp [ns]', 'duration [ms]',
-                         'amplitude [px]', 'amplitude [deg]', 
-                         'mean_velocity [px/s]', 'peak_velocity [px/s]']
-        
-        # Rename columns to match expected format
-        column_mapping = {
-            'start_time_ns': 'start_timestamp [ns]',
-            'end_time_ns': 'end_timestamp [ns]',
-            'duration_ms': 'duration [ms]',
-            'amplitude_pixels': 'amplitude [px]',
-            'amplitude_angle_deg': 'amplitude [deg]',
-            'mean_velocity': 'mean_velocity [px/s]',
-            'max_velocity': 'peak_velocity [px/s]'
-        }
-        
-        # Apply column renaming
-        for old_name, new_name in column_mapping.items():
-            if old_name in df.columns:
-                df.rename(columns={old_name: new_name}, inplace=True)
-        
-        # Ensure all required columns exist
-        for col in ordered_cols:
-            if col not in df.columns:
-                # For missing columns, add with NaN values
-                print(f"Warning: Adding missing column {col} with NaN values")
-                df[col] = np.nan
-        
-        # Save to CSV with ordered columns
-        final_cols = ordered_cols + ['detected_timestamp', 'detected_datetime']
-        final_df = df[final_cols]
-        final_df.to_csv(output_file, index=False)
-        print(f"Saccades data saved to: {output_file}")
-        
-    except Exception as e:
-        print(f"Error creating DataFrame: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
-        try:
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                # Convert numpy arrays to lists for JSON serialization
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'data_shape': saccade_data.shape,
-                    'data_sample': saccade_data[0].tolist() if len(saccade_data) > 0 else []
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            
-            # Also try to save as numpy file
-            np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-            np.save(np_file, saccade_data)
-            np_timestamps = os.path.join(output_dir, f"{stream_name}_timestamps.npy")
-            np.save(np_timestamps, timestamps)
-            print(f"Fallback: Data saved as numpy files: {np_file} and {np_timestamps}")
-        except Exception as fallback_error:
-            print(f"Fallback save also failed: {fallback_error}")
-
-def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30, include_csv=False):
-    """Extract all streams from XDF file
-    
-    Args:
-        xdf_file: Path to the XDF file
-        output_dir: Directory to save extracted data
-        keep_raw_depth: If True, keeps raw depth data for measurements. If False, deletes it after creating MP4
-        depth_interval: Save raw depth PNG every N frames (default: 30)
-        include_csv: Whether to include CSV distance maps (default: False)
-    """
     if pyxdf is None:
         raise RuntimeError(
             "pyxdf is required for XDF extraction; install "
             "naturallab[acquisition]"
         )
+    if depth_interval <= 0:
+        raise ValueError("depth_interval must be a positive integer")
     print(f"Loading XDF file: {xdf_file}")
-    print(f"Raw depth data will be {'kept' if keep_raw_depth else 'deleted'} after processing")
+    print(
+        "Raw depth data will be "
+        f"{'kept' if keep_raw_depth else 'deleted'} after processing"
+    )
     print(f"Saving raw depth PNG every {depth_interval} frames")
-    
-    try:
-        # Load XDF file
-        streams, fileheader = pyxdf.load_xdf(xdf_file)
-        
-        # A reused directory can mix files from different sessions or roles.
-        output_dir = _prepare_extraction_output_dir(output_dir)
-        
-        print(f"XDF file loaded. Found {len(streams)} streams:")
-        
-        # List all streams
-        for i, stream in enumerate(streams):
-            name = stream['info']['name'][0]
-            stream_type = stream['info']['type'][0]
-            channel_count = int(stream['info']['channel_count'][0])
-            sample_count = len(stream['time_series'])
-            print(f"  {i+1}. {name} (Type: {stream_type}, Channels: {channel_count}, Samples: {sample_count})")
 
-        declared_imu_streams = [
-            stream for stream in streams if _is_declared_imu_stream(stream)
-        ]
-        imu_filenames = _plan_imu_output_filenames(declared_imu_streams)
-        imu_filename_by_id = {
-            id(stream): filename
-            for stream, filename in zip(declared_imu_streams, imu_filenames)
-        }
-        
-        # Track any depth raw folders for cleanup if needed
+    staging_dir = None
+    final_output_dir = os.path.abspath(os.fspath(output_dir))
+    try:
+        streams, _fileheader = pyxdf.load_xdf(xdf_file)
+        if not streams:
+            raise RuntimeError("XDF file contains no streams")
+        output_stems = _plan_stream_output_stems(streams)
+        final_output_dir, staging_dir = _prepare_extraction_staging_dir(
+            final_output_dir
+        )
+
+        print(f"XDF file loaded. Found {len(streams)} streams:")
+        for index, stream in enumerate(streams):
+            name = _stream_name(stream)
+            stream_type = _stream_type(stream)
+            channel_count = _declared_channel_count(stream, name)
+            sample_count = len(stream.get("time_series", []))
+            print(
+                f"  {index + 1}. {name} (Type: {stream_type}, "
+                f"Channels: {channel_count}, Samples: {sample_count})"
+            )
+
         depth_raw_dirs = []
-        
-        # Track if we've found certain specialized stream types
         found_imu = False
         found_fixations = False
         found_saccades = False
         extraction_errors = []
         imu_outputs = []
         depth_outputs = []
-        
-        # First pass - extract normal streams and identify special streams
+
         for stream in streams:
-            name = "<unknown>"
+            name = _stream_name(stream)
+            stem = output_stems[id(stream)]
             try:
-                name = stream['info']['name'][0]
-                stream_type = stream['info']['type'][0]
-                
-                # Check for specialized streams by name and type
+                normalized_type = _stream_type(stream).strip().lower()
                 if _is_declared_imu_stream(stream):
                     found_imu = True
                     output_path = extract_imu_stream(
                         stream,
-                        output_dir,
-                        output_filename=imu_filename_by_id[id(stream)],
+                        staging_dir,
+                        output_stem=stem,
                     )
-                    if output_path is not None:
-                        imu_outputs.append((name, os.path.basename(output_path)))
-                    continue
-                    
-                if name.lower() in ['neonfixations', 'neon_fixations', 'fixations']:
+                    imu_outputs.append((name, os.path.basename(output_path)))
+                elif normalized_type == "fixations":
                     found_fixations = True
-                    extract_fixations_stream(stream, output_dir)
-                    continue
-                    
-                if name.lower() in ['neonsaccades', 'neon_saccades', 'saccades']:
+                    extract_fixations_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
+                elif normalized_type == "saccades":
                     found_saccades = True
-                    extract_saccades_stream(stream, output_dir)
-                    continue
-                
-                # Regular stream processing
-                if stream_type == 'VideoStream':
-                    extract_video_stream(stream, output_dir)
-                elif stream_type == 'Depth' or stream_type == 'DepthData':
-                    # Handle all depth-related streams with one function, passing the additional parameters
-                    depth_dir = os.path.join(output_dir, f"{name}_depth")
+                    extract_saccades_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
+                elif normalized_type == "videostream":
+                    extract_video_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
+                elif normalized_type in {"depth", "depthdata"}:
+                    depth_dir = os.path.join(staging_dir, f"{stem}_depth")
                     if not keep_raw_depth:
-                        depth_raw_dirs.append(depth_dir)
+                        depth_raw_dirs.append((name, depth_dir))
                     depth_scale, scale_source = _resolve_depth_scale(
                         stream,
                         streams,
                     )
-                    depth_result = extract_depth_stream(
-                        stream,
-                        output_dir,
-                        save_interval=depth_interval,
-                        include_csv=include_csv,
-                        depth_scale_m_per_unit=depth_scale,
-                        depth_scale_source=scale_source,
+                    depth_outputs.append(
+                        extract_depth_stream(
+                            stream,
+                            staging_dir,
+                            output_stem=stem,
+                            save_interval=depth_interval,
+                            include_csv=include_csv,
+                            depth_scale_m_per_unit=depth_scale,
+                            depth_scale_source=scale_source,
+                        )
                     )
-                    if depth_result is not None:
-                        depth_outputs.append(depth_result)
-                elif stream_type == 'Audio':
-                    extract_audio_stream(stream, output_dir)
-                elif stream_type == 'Gaze':
-                    extract_gaze_stream(stream, output_dir)
-                elif stream_type == 'DeviceInfo':
-                    extract_metadata_stream(stream, output_dir)
+                elif normalized_type == "audio":
+                    extract_audio_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
+                elif normalized_type == "gaze":
+                    extract_gaze_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
+                elif normalized_type == "deviceinfo":
+                    extract_metadata_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
                 else:
-                    # Try to infer stream type from name if not already identified
-                    if 'fixation' in name.lower() and not found_fixations:
-                        found_fixations = True
-                        extract_fixations_stream(stream, output_dir)
-                    elif 'saccade' in name.lower() and not found_saccades:
-                        found_saccades = True
-                        extract_saccades_stream(stream, output_dir)
-                    elif 'imu' in name.lower() and not found_imu:
-                        found_imu = True
-                        output_path = extract_imu_stream(stream, output_dir)
-                        if output_path is not None:
-                            imu_outputs.append(
-                                (name, os.path.basename(output_path))
-                            )
-                    else:
-                        # Generic stream extractor for other types
-                        extract_generic_stream(stream, output_dir)
-                        
+                    extract_generic_stream(
+                        stream,
+                        staging_dir,
+                        output_stem=stem,
+                    )
             except Exception as stream_error:
                 print(f"Error extracting stream {name}: {stream_error}")
-                import traceback
-                traceback.print_exc()
-                print("Continuing with next stream...")
                 extraction_errors.append(f"{name}: {stream_error}")
-        
-        # Second pass - look for specialized streams by contents if not found by name/type
-        if not found_imu or not found_fixations or not found_saccades:
-            print("\nChecking for specialized streams by content pattern...")
-            
-            for stream in streams:
-                name = "<unknown>"
-                try:
-                    name = stream['info']['name'][0]
-                    stream_type = stream['info']['type'][0]
-                    channel_count = int(stream['info']['channel_count'][0])
-                    
-                    # Skip already processed specialized streams
-                    if (_is_declared_imu_stream(stream) or
-                        (name.lower() in ['neonfixations', 'neon_fixations', 'fixations']) or
-                        (name.lower() in ['neonsaccades', 'neon_saccades', 'saccades'])):
-                        continue
-                    
-                    # Try to detect specialized streams by channel count and patterns
-                    if not found_imu and channel_count >= 9 and channel_count <= 13:
-                        # IMU typically has 9-13 channels (gyro xyz, accel xyz, quaternion wxyz, optional euler angles)
-                        print(f"Stream '{name}' looks like it might contain IMU data (has {channel_count} channels)")
-                        if input("Extract as IMU data? (y/n): ").lower().startswith('y'):
-                            output_path = extract_imu_stream(stream, output_dir)
-                            if output_path is not None:
-                                imu_outputs.append(
-                                    (name, os.path.basename(output_path))
-                                )
-                            found_imu = True
-                            continue
-                    
-                    if not found_fixations and channel_count >= 6 and channel_count <= 8:
-                        # Fixations typically have 6-8 channels
-                        print(f"Stream '{name}' looks like it might contain fixation data (has {channel_count} channels)")
-                        if input("Extract as fixations data? (y/n): ").lower().startswith('y'):
-                            extract_fixations_stream(stream, output_dir)
-                            found_fixations = True
-                            continue
-                    
-                    if not found_saccades and channel_count >= 7 and channel_count <= 8:
-                        # Saccades typically have 7-8 channels
-                        print(f"Stream '{name}' looks like it might contain saccade data (has {channel_count} channels)")
-                        if input("Extract as saccades data? (y/n): ").lower().startswith('y'):
-                            extract_saccades_stream(stream, output_dir)
-                            found_saccades = True
-                            continue
-                
-                except Exception as detect_error:
-                    print(f"Error during stream type detection for {name}: {detect_error}")
-                    extraction_errors.append(
-                        f"specialized detection for {name}: {detect_error}"
-                    )
-                    continue
-        
-        # Clean up the raw depth folders if requested
+
         if not keep_raw_depth:
-            for raw_dir in depth_raw_dirs:
-                if os.path.exists(raw_dir):
-                    import shutil
-                    try:
+            for depth_name, raw_dir in depth_raw_dirs:
+                try:
+                    if os.path.exists(raw_dir):
                         print(f"Removing raw depth data folder: {raw_dir}")
                         shutil.rmtree(raw_dir)
-                        print(f"Successfully removed: {raw_dir}")
-                    except Exception as e:
-                        print(f"Error removing directory {raw_dir}: {e}")
-                        extraction_errors.append(
-                            f"raw-depth cleanup for {raw_dir}: {e}"
-                        )
+                except Exception as cleanup_error:
+                    extraction_errors.append(
+                        f"raw-depth cleanup for {depth_name}: "
+                        f"{cleanup_error}"
+                    )
         else:
             print("Keeping all raw depth data for future measurement purposes")
-        
-        # Print summary of specialized streams
+
         print("\nSpecialized streams extraction summary:")
         if imu_outputs:
             imu_summary = ", ".join(
                 f"{stream_name} -> {filename}"
                 for stream_name, filename in imu_outputs
             )
-            print(f"- IMU data: {len(imu_outputs)} stream(s) extracted: {imu_summary}")
+            print(
+                f"- IMU data: {len(imu_outputs)} stream(s) extracted: "
+                f"{imu_summary}"
+            )
         elif found_imu:
             print("- IMU data: Found, but no CSV was produced")
         else:
@@ -1706,9 +1641,15 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
             )
         else:
             print("- Depth data: Not found or not safely extractable")
-        print(f"- Fixations data: {'Extracted' if found_fixations else 'Not found'}")
-        print(f"- Saccades data: {'Extracted' if found_saccades else 'Not found'}")
-        
+        print(
+            "- Fixations data: "
+            f"{'Extracted' if found_fixations else 'Not found'}"
+        )
+        print(
+            "- Saccades data: "
+            f"{'Extracted' if found_saccades else 'Not found'}"
+        )
+
         if extraction_errors:
             summary = "; ".join(extraction_errors[:5])
             if len(extraction_errors) > 5:
@@ -1718,13 +1659,16 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                 f"error(s)): {summary}"
             )
 
-        print(f"\nAll streams extracted to: {output_dir}")
-        
-    except Exception as e:
-        print(f"Error extracting XDF file: {e}")
-        import traceback
-        traceback.print_exc()
+        _publish_extraction_staging_dir(staging_dir, final_output_dir)
+        staging_dir = None
+        print(f"\nAll streams extracted to: {final_output_dir}")
+        return final_output_dir
+    except Exception as error:
+        print(f"Error extracting XDF file: {error}")
         raise
+    finally:
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 def main():
     """Main function"""
@@ -1734,8 +1678,8 @@ def main():
     parser.add_argument("--outdir", type=str, default="extracted_data", help="Output directory (default: extracted_data)")
     parser.add_argument("--no-raw-depth", action="store_true", 
                         help="Delete raw depth data after creating MP4 (not recommended for measurements)")
-    parser.add_argument("--depth-interval", type=int, default=1, 
-                        help="Save raw depth PNG every N frames (default: 30, use 1 for all frames)")
+    parser.add_argument("--depth-interval", type=int, default=1,
+                        help="Save raw depth PNG every N frames (default: 1)")
     parser.add_argument("--include-csv", action="store_true", 
                         help="Include CSV distance maps (increases disk usage)")
     args = parser.parse_args()

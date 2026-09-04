@@ -148,6 +148,13 @@ session to display the NaturalLab recording window.
 
 ## 5. Configure the NaturalLab recording window
 
+This window is a compatibility workflow for the current dyadic Neon setup: it
+has explicit Child and Caregiver device fields, and its optional eye-event
+stream is tied to the Child field. The downstream video, tracking, calibration,
+and gaze APIs are not limited to those two roles. Labs with different wearable
+roles should use their own LSL adapter or adapt the acquisition module and
+validate the resulting stream names before collecting participants.
+
 Activate the same environment and open the recorder:
 
 ```bash
@@ -245,9 +252,11 @@ experiment 1 and the **Acceptance** block.
 
 Open every extracted video. Check that the expected view is present for the
 full recording and that playback, duration, and frame count look plausible.
-With one IMU stream, the export is `imu.csv`; with multiple Neon devices, each
-role receives a separate file such as `imu_neonimu_child.csv`. For RealSense,
-keep the generated `<stream>_depth_metadata.json` beside the raw depth images:
+Every export is named from a safe, lowercase form of its stream label; the
+extraction summary retains the original label and shows mappings such as
+`NeonIMU_Child -> neonimu_child.csv`. NaturalLab stops if two labels would map
+to the same filename instead of overwriting either stream. For RealSense, keep
+the generated `<safe-stream-name>_depth_metadata.json` beside the raw depth images:
 it records the hardware scale needed to convert device values into metres.
 Extraction stops instead of guessing when that scale is missing or conflicts
 with the recorded metadata.
@@ -282,10 +291,10 @@ python -m naturallab.acquisition.xdf_extract \
 ```
 
 Repeat that extraction for the floor and check XDF files, choosing a different
-output folder each time. The extracted MP4 takes the stream name entered in the
-recording window. A stream named `camera-01`, for example, becomes
-`camera-01.mp4`. If a different recorder already produced normal video files,
-use those files directly and skip XDF extraction.
+output folder each time. The extracted MP4 takes a safe, lowercase form of the
+stream name entered in the recording window. A stream named `camera-01`, for
+example, becomes `camera_01.mp4`. If a different recorder already produced
+normal video files, use those files directly and skip XDF extraction.
 
 Play one extracted video before running the commands. Set `--input-rotation` to
 `none`, `90_cw`, `180`, or `90_ccw` so the decoded image is upright. Use the
@@ -295,7 +304,7 @@ Run the three matching commands:
 
 ```bash
 naturallab calibrate intrinsic \
-  --video extracted/calibration/camera-01-intrinsic/camera-01.mp4 \
+  --video extracted/calibration/camera-01-intrinsic/camera_01.mp4 \
   --camera-id camera-01 \
   --input-rotation none \
   --inner-cols 7 --inner-rows 7 \
@@ -304,7 +313,7 @@ naturallab calibrate intrinsic \
   --save-frames
 
 naturallab calibrate floor \
-  --video extracted/calibration/camera-01-floor/camera-01.mp4 \
+  --video extracted/calibration/camera-01-floor/camera_01.mp4 \
   --intrinsics calibration/camera-01/intrinsic/intrinsics.yaml \
   --inner-cols 7 --inner-rows 7 \
   --square-size-mm 30 \
@@ -312,7 +321,7 @@ naturallab calibrate floor \
   --save-frames
 
 naturallab calibrate verify \
-  --video extracted/calibration/camera-01-verification/camera-01.mp4 \
+  --video extracted/calibration/camera-01-verification/camera_01.mp4 \
   --bundle calibration/camera-01/floor/calibration-bundle.yaml \
   --inner-cols 7 --inner-rows 7 \
   --square-size-mm 30 \
@@ -360,7 +369,7 @@ movement measurements.
 |---|---:|---|
 | Detect and track people in video | No | [Software quick start](quickstart.md#2-track-people-in-an-existing-video) |
 | Measure a person's movement on the floor | No; verified camera calibration is required | [Calibration section](#8-calibrate-each-fixed-room-camera-automatically) |
-| Assign roles such as child and caregiver | No new training; the approved Qwen service is required | [Qwen/DeepSORT path](quickstart.md#3-use-the-current-operational-qwendeepsort-path) |
+| Assign roles such as child and caregiver | No new training; the approved Qwen service is required | [Qwen/DeepSORT path](quickstart.md#3-use-the-supported-qwendeepsort-client-path) |
 | Find the lab's own toys or materials | Usually not at first; use reference-image prototypes | [Object detector setup](object_detection_guide.md) |
 | Detect a new category reliably when prototypes are insufficient | Usually yes; training is currently external to NaturalLab | [Training handoff](object_detection_guide.md#when-reference-images-are-not-enough) |
 
@@ -385,7 +394,7 @@ orientation, or resolution changes.
 
 ## Other camera configurations
 
-The simpler source-checkout script accepts any matching list of camera URLs and
+The source-checkout helper accepts any matching list of RTSP camera URLs and
 names. It is useful when cameras do not share credentials or when more than four
 views are needed:
 
@@ -395,7 +404,19 @@ python scripts/stream_synchronized_sensors.py \
   --camera-names "camera-01,camera-02"
 ```
 
-There must be exactly one name for every URL. Add optional `--neon-ips` and
-matching `--neon-names`, or `--realsense`, only after the camera-only recording
-works. Credentialed URLs can appear in the shell's process list and history, so
-prefer the recording window for cameras that share one login.
+There must be exactly one unique name for every URL. The helper waits until each
+requested source has published its first sample. If any source cannot start or
+its worker later stops, the complete process stops with a nonzero status instead
+of reporting a partial sensor set as healthy.
+
+Add optional `--neon-ips` and matching `--neon-names`, or `--realsense`, only
+after the camera-only recording works. In this helper, Neon means matched scene
+video and gaze only; it does not include Neon audio, IMU, or eye events. Use the
+recording window when those streams are required. RealSense produces colour,
+raw 16-bit depth, and a metadata stream; the measured hardware depth scale is
+stored both with the depth stream and in the metadata stream so strict XDF
+extraction can convert values safely.
+
+Credentialed URLs can appear in the shell's process list and history when this
+command-line helper is used. Prefer the recording window for cameras that share
+one login; it sends credentials to the recorder through a one-use input pipe.

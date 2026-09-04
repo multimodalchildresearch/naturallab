@@ -568,7 +568,19 @@ def scan_calibration_video(
         raise AutomaticCalibrationError(
             f"video reports an invalid frame rate: {fps}"
         )
-    reported_frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    reported_frame_count_value = float(
+        capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    )
+    if (
+        not math.isfinite(reported_frame_count_value)
+        or reported_frame_count_value < 1.0
+    ):
+        capture.release()
+        raise AutomaticCalibrationError(
+            "video does not report a trustworthy positive frame count; "
+            "use a complete, finalized recording"
+        )
+    reported_frame_count = int(reported_frame_count_value)
     sample_step = max(1, round(fps * float(sample_seconds)))
 
     detections = []
@@ -612,6 +624,16 @@ def scan_calibration_video(
     if image_size is None:
         raise AutomaticCalibrationError(
             f"no frames could be decoded from video: {source}"
+        )
+    # Some OpenCV/container combinations differ by one terminal frame.  A
+    # larger shortfall means calibration would silently use only a prefix of a
+    # damaged or incompletely copied recording, which is not an acceptable
+    # scientific input contract.
+    if frame_index + 1 < reported_frame_count:
+        raise AutomaticCalibrationError(
+            "video decoding ended early after "
+            f"{frame_index} of {reported_frame_count} reported frames; "
+            "use a complete, finalized recording"
         )
     return (
         tuple(detections),
@@ -932,8 +954,6 @@ def calibrate_intrinsics_from_video(
         "schema_version": "1.0",
         "kind": "automatic_intrinsic_calibration_report",
         "camera_id": artifact.camera_id,
-        "source_video": str(source),
-        "source_video_size_bytes": source.stat().st_size,
         "source_video_identity": source_identity(source),
         "board": board.to_dict(),
         "input_rotation": input_rotation.value,
@@ -1709,8 +1729,6 @@ def calibrate_floor_from_video(
         "schema_version": "1.0",
         "kind": "automatic_floor_calibration_report",
         "camera_id": intrinsics.camera_id,
-        "source_video": str(source),
-        "source_video_size_bytes": source.stat().st_size,
         "source_video_identity": source_identity(source),
         "intrinsic_sha256": intrinsics.sha256,
         "board": board.to_dict(),
@@ -1901,8 +1919,6 @@ def verify_floor_from_video(
         "kind": "automatic_floor_verification_report",
         "status": status,
         "camera_id": bundle.camera_id,
-        "source_video": str(source),
-        "source_video_size_bytes": source.stat().st_size,
         "source_video_identity": source_identity(source),
         "intrinsic_sha256": bundle.intrinsics.sha256,
         "floor_calibration_sha256": bundle.floor_plane.sha256,
@@ -2131,7 +2147,7 @@ def save_annotated_detections(
 
 
 def source_identity(path: Path | str) -> Dict[str, Any]:
-    """Return secret-free source provenance including a content fingerprint."""
+    """Return path-free source provenance with a content fingerprint."""
 
     source = Path(path).expanduser().resolve()
     stat = os.stat(source)
@@ -2140,8 +2156,6 @@ def source_identity(path: Path | str) -> Dict[str, Any]:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return {
-        "path": str(source),
         "size_bytes": stat.st_size,
-        "modified_time_ns": stat.st_mtime_ns,
         "sha256": digest.hexdigest(),
     }

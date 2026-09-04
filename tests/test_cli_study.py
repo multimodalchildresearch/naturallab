@@ -107,6 +107,8 @@ def test_study_validate_json_reports_validated_manifest(
     assert payload["selected_steps"] == ["tracking", "align"]
     assert payload["skipped_steps"] == ["fusion"]
     assert len(payload["manifest_fingerprint"]) == 64
+    assert payload["manifest"] == "session.yaml"
+    assert str(tmp_path) not in captured.out
 
 
 def test_study_plan_uses_dependency_order_without_writing_state(
@@ -125,7 +127,9 @@ def test_study_plan_uses_dependency_order_without_writing_state(
         "align",
     ]
     assert payload["selected_steps"][1]["depends_on"] == ["tracking"]
-    assert payload["state_path"] == str(state_path)
+    assert payload["state_path"] == "session.run-state.json"
+    assert payload["manifest"] == "session.yaml"
+    assert str(tmp_path) not in json.dumps(payload)
     assert not state_path.exists()
 
 
@@ -148,6 +152,8 @@ def test_study_status_without_state_shows_initial_status_and_is_read_only(
         "align": "pending",
         "fusion": "skipped",
     }
+    assert payload["state_path"] == "session.run-state.json"
+    assert str(tmp_path) not in json.dumps(payload)
     assert not state_path.exists()
 
 
@@ -197,6 +203,13 @@ def test_study_status_reads_explicit_state_without_modifying_it(
     assert payload["manifest_fingerprint_matches"] is True
     assert statuses["tracking"] == "completed"
     assert statuses["align"] == "failed"
+    assert payload["steps"][1]["error"] == {
+        "type": "Error",
+        "message": "missing gaze timestamps",
+    }
+    assert payload["manifest"] == "session.yaml"
+    assert payload["state_path"] == "state/custom.json"
+    assert str(tmp_path) not in json.dumps(payload)
     assert payload["unexpected_state_steps"] == ["removed-step"]
     assert state_path.read_bytes() == before
 
@@ -215,3 +228,54 @@ def test_study_validation_error_is_concise(
     assert captured.out == ""
     assert "manifest.study_id is required" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_study_plan_redacts_external_absolute_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest_dir = tmp_path / "manifest-directory"
+    manifest_dir.mkdir()
+    path = manifest_dir / "session.yaml"
+    data = _manifest_data()
+    private_input = tmp_path / "researcher-private" / "tracking.yaml"
+    windows_input = r"C:\Users\Researcher Name\private-tracking.yaml"
+    data["steps"]["tracking"]["inputs"] = [
+        str(private_input),
+        windows_input,
+    ]
+    path.write_text(
+        yaml.safe_dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    exit_code = main(["study", "plan", str(path), "--json"])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    identities = payload["selected_steps"][0]["inputs"]
+    assert exit_code == 0
+    assert captured.err == ""
+    assert identities[0].startswith("tracking.yaml [path-id:")
+    assert identities[1].startswith("private-tracking.yaml [path-id:")
+    assert str(tmp_path) not in captured.out
+    assert "researcher-private" not in captured.out
+    assert windows_input not in captured.out
+    assert "\\Users\\" not in captured.out
+
+
+def test_study_load_error_redacts_requested_absolute_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    missing = tmp_path / "Private Researcher Name" / "missing.yaml"
+
+    exit_code = main(["study", "validate", str(missing)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert "ManifestError" in captured.err
+    assert "<path:missing.yaml>" in captured.err
+    assert str(tmp_path) not in captured.err
+    assert "Private Researcher Name" not in captured.err

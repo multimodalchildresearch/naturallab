@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Recording Setup GUI for Ubuntu - Multi-Device Support
-======================================================
-A GUI for managing LSL streaming with multiple Neon devices, LabRecorder, and
-XDF extraction, including Caregiver/Child role assignment.
+NaturalLab recording setup window
+=================================
+A desktop window for the current lab's room cameras, dyadic Neon devices,
+RealSense, LabRecorder, and XDF extraction.
 
 Usage:
     python recording_gui.py
@@ -163,6 +163,23 @@ def redact_log_text(value):
         lambda match: redact_rtsp_url(match.group(0)),
         str(value),
     )
+
+
+def _send_rtsp_configuration(process, rtsp_urls, camera_names):
+    """Send credentialed camera configuration over the child's stdin pipe."""
+
+    process_input = getattr(process, "stdin", None)
+    if process_input is None:
+        raise RuntimeError("the recorder process did not provide a private input pipe")
+    try:
+        json.dump(
+            {"rtsp_urls": list(rtsp_urls), "camera_names": list(camera_names)},
+            process_input,
+        )
+        process_input.write("\n")
+        process_input.flush()
+    finally:
+        process_input.close()
 
 
 def _sanitized_config(config):
@@ -392,21 +409,21 @@ class RecordingGUI:
                                          command=self.quick_setup, style="Accent.TButton")
         self.quick_setup_btn.pack(side=tk.LEFT, padx=5)
         
-        self.emergency_stop_btn = ttk.Button(quick_frame, text="🛑 Emergency Stop All", 
+        self.emergency_stop_btn = ttk.Button(quick_frame, text="Stop This Setup",
                                            command=self.emergency_stop, style="Accent.TButton")
         self.emergency_stop_btn.pack(side=tk.LEFT, padx=5)
         
-        # LSL Kill Switch
+        # Recorder recovery controls
         kill_frame = ttk.Frame(control_frame)
         kill_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Label(kill_frame, text="LSL Kill Switch:").pack(side=tk.LEFT)
+        ttk.Label(kill_frame, text="Recorder status:").pack(side=tk.LEFT)
         
-        ttk.Button(kill_frame, text="🔍 Check LSL Processes", 
+        ttk.Button(kill_frame, text="Check",
                   command=self.check_lsl_processes).pack(side=tk.LEFT, padx=5)
         
-        ttk.Button(kill_frame, text="💀 Force Kill All LSL", 
-                  command=self.force_kill_all_lsl).pack(side=tk.LEFT, padx=5)
+        ttk.Button(kill_frame, text="Force Stop This Recorder",
+                  command=self.force_stop_lsl).pack(side=tk.LEFT, padx=5)
         
         # Multi-device recording parameters
         params_frame = ttk.LabelFrame(main_frame, text="Multi-Device Parameters", padding=10)
@@ -432,13 +449,17 @@ class RecordingGUI:
         ttk.Entry(child_frame, textvariable=self.child_ip_var, width=20).pack(side=tk.LEFT, padx=5)
         ttk.Label(child_frame, text="(e.g., 192.168.1.121)", foreground="gray").pack(side=tk.LEFT, padx=5)
         
-        # Max devices
+        # Discovery limit. Discovered devices receive neutral labels.
         max_devices_frame = ttk.Frame(device_frame)
         max_devices_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(max_devices_frame, text="Max Devices:", width=15).pack(side=tk.LEFT)
+        ttk.Label(max_devices_frame, text="Max discovered:", width=15).pack(side=tk.LEFT)
         self.max_devices_var = tk.IntVar()
         ttk.Spinbox(max_devices_frame, from_=1, to=4, textvariable=self.max_devices_var, width=5).pack(side=tk.LEFT, padx=5)
-        ttk.Label(max_devices_frame, text="(auto-assigns if IPs not specified)", foreground="gray").pack(side=tk.LEFT, padx=5)
+        ttk.Label(
+            max_devices_frame,
+            text="(uses neutral Device1, Device2 labels)",
+            foreground="gray",
+        ).pack(side=tk.LEFT, padx=5)
         
         # Camera configuration - Individual fields for each camera
         camera_frame = ttk.LabelFrame(params_frame, text="Additional Cameras (RTSP)", padding=5)
@@ -1053,7 +1074,12 @@ the exact lab configuration before use."""
             return
 
         if not no_neon and not caregiver_ip and not child_ip:
-            if not messagebox.askyesno("No Device IPs", "No device IPs specified. Continue with auto-discovery?"):
+            if not messagebox.askyesno(
+                "Discover Neon devices?",
+                "No Neon addresses were entered. Continue with discovery? "
+                "Discovered units receive neutral Device1/Device2 labels; "
+                "verify the physical mapping before recording.",
+            ):
                 return
         
         try:
@@ -1092,8 +1118,7 @@ the exact lab configuration before use."""
             
             # Add camera arguments if any cameras are enabled
             if rtsp_urls:
-                cmd.extend(["--rtsp-urls", ",".join(rtsp_urls)])
-                cmd.extend(["--camera-names", ",".join(camera_names)])
+                cmd.append("--rtsp-config-stdin")
                 self.log(f"Added {len(rtsp_urls)} cameras: {', '.join(camera_names)}")
             else:
                 self.log("No cameras enabled")
@@ -1116,13 +1141,41 @@ the exact lab configuration before use."""
             self.log(f"Starting multi-device LSL streaming: {' '.join(safe_command)}")
             
             # Start process
+            popen_options = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "universal_newlines": True,
+                "cwd": os.path.dirname(script_path) if script_path else None,
+            }
+            if rtsp_urls:
+                popen_options["stdin"] = subprocess.PIPE
             self.lsl_process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                cwd=os.path.dirname(script_path) if script_path else None
+                **popen_options,
             )
+            if rtsp_urls:
+                try:
+                    _send_rtsp_configuration(
+                        self.lsl_process,
+                        rtsp_urls,
+                        camera_names,
+                    )
+                except Exception:
+                    failed_process = self.lsl_process
+                    try:
+                        if failed_process.poll() is None:
+                            failed_process.terminate()
+                        try:
+                            failed_process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            failed_process.kill()
+                            failed_process.wait()
+                    finally:
+                        self.lsl_process = None
+                    raise RuntimeError(
+                        "Could not transfer the private camera configuration "
+                        "to the recorder process"
+                    ) from None
             
             self.streaming_active = True
             self.start_lsl_btn.config(state=_TK_DISABLED)
@@ -1343,119 +1396,56 @@ the exact lab configuration before use."""
         )
     
     def emergency_stop(self):
-        """Emergency stop - stop everything"""
-        self.log("Emergency stop initiated...")
-        
-        # Try graceful stop first for any LSL processes
-        try:
-            result = subprocess.run(["pgrep", "-f", "lsl_streams.py"], capture_output=True, text=True)
-            if result.stdout.strip():
-                pids = result.stdout.strip().split('\n')
-                self.log(f"Sending SIGINT to LSL processes: {pids}")
-                for pid in pids:
-                    try:
-                        os.kill(int(pid), signal.SIGINT)
-                    except Exception:
-                        pass
-                
-                time.sleep(2)
-                
-                # Check if any are still running and force kill
-                result = subprocess.run(["pgrep", "-f", "lsl_streams.py"], capture_output=True, text=True)
-                if result.stdout.strip():
-                    remaining_pids = result.stdout.strip().split('\n')
-                    self.log(f"Force killing remaining LSL processes: {remaining_pids}")
-                    for pid in remaining_pids:
-                        try:
-                            os.kill(int(pid), signal.SIGKILL)
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-        
-        # Stop LSL streaming
-        if self.streaming_active:
+        """Stop only the recorder and LabRecorder started by this window."""
+        self.log("Stopping this recording setup...")
+
+        if self.lsl_process is not None or self.streaming_active:
             self.stop_lsl_streaming()
-        
-        # Close LabRecorder
+
         if self.labrecorder_process:
             self.close_labrecorder()
-        
-        self.log("Emergency stop completed")
-        messagebox.showinfo("Emergency Stop", "All processes have been stopped")
+
+        self.log("This recording setup has been stopped")
+        messagebox.showinfo(
+            "Setup stopped",
+            "The recorder processes started by this window have been stopped.",
+        )
     
     def check_lsl_processes(self):
-        """Check what LSL processes are actually running"""
-        self.log("=== CHECKING LSL PROCESSES ===")
-        
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "lsl_streams.py"], 
-                capture_output=True, text=True
-            )
-            
-            if result.stdout.strip():
-                pids = result.stdout.strip().split('\n')
-                self.log(f"Found LSL processes with PIDs: {pids}")
-                
-                for pid in pids:
-                    try:
-                        ps_result = subprocess.run(
-                            ["ps", "-p", pid, "-o", "pid,ppid,cmd"], 
-                            capture_output=True, text=True
-                        )
-                        lines = ps_result.stdout.strip().split('\n')
-                        if len(lines) > 1:
-                            self.log(
-                                f"Process {pid}: {redact_log_text(lines[1])}"
-                            )
-                    except Exception as e:
-                        self.log(f"Error getting details for PID {pid}: {e}")
-            else:
-                self.log("No LSL processes found")
-            
-            self.log(f"GUI thinks streaming_active: {self.streaming_active}")
-            if self.lsl_process:
-                if self.lsl_process.poll() is None:
-                    self.log(f"GUI tracked process {self.lsl_process.pid}: RUNNING")
-                else:
-                    self.log(f"GUI tracked process {self.lsl_process.pid}: DEAD (return code: {self.lsl_process.poll()})")
-            else:
-                self.log("GUI: No process tracked")
-                
-        except Exception as e:
-            self.log(f"Error checking processes: {e}")
+        """Report only the recorder process owned by this window."""
+        process = self.lsl_process
+        if process is None:
+            self.log("This window has no recorder process")
+            return
+        return_code = process.poll()
+        if return_code is None:
+            self.log("This window's recorder is running")
+        else:
+            self.log(f"This window's recorder stopped with code {return_code}")
     
-    def force_kill_all_lsl(self):
-        """Force kill all LSL processes"""
-        self.log("=== FORCE KILL ALL LSL ===")
-        
+    def force_stop_lsl(self):
+        """Force-stop only the recorder process owned by this window."""
+        self.log("Force-stopping this window's recorder...")
+        process = self.lsl_process
         try:
-            result = subprocess.run(["pgrep", "-f", "lsl_streams.py"], capture_output=True, text=True)
-            if result.stdout.strip():
-                pids = result.stdout.strip().split('\n')
-                self.log(f"Found LSL processes to kill: {pids}")
-                
-                for pid in pids:
-                    try:
-                        os.kill(int(pid), signal.SIGKILL)
-                        self.log(f"Force killed process {pid}")
-                    except Exception as e:
-                        self.log(f"Could not kill process {pid}: {e}")
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+                self.log("This window's recorder was force-stopped")
             else:
-                self.log("No LSL processes found to kill")
-                
-            # Reset GUI state
+                self.log("This window has no running recorder to stop")
+        except Exception as error:
+            self.log(f"Could not force-stop this window's recorder: {error}")
+        finally:
             self.lsl_process = None
             self.streaming_active = False
             self.start_lsl_btn.config(state=_TK_NORMAL)
             self.stop_lsl_btn.config(state=_TK_DISABLED)
-            self.log("GUI state reset")
-            
-            messagebox.showinfo("Force Kill Complete", "All LSL processes have been force killed!")
-            
-        except Exception as e:
-            self.log(f"Error in force kill: {e}")
+
+        messagebox.showinfo(
+            "Recorder stopped",
+            "The recorder started by this window is no longer running.",
+        )
     
     def refresh_file_list(self):
         """Refresh the file list"""

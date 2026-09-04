@@ -182,7 +182,7 @@ def test_role_assignment_supports_explicit_abstention():
         )
     )
     assignment = QwenTrackRoleAssigner(
-        roles=("child", "caregiver"),
+        roles=("participant", "facilitator"),
         transport=transport,
     ).assign_role(
         "track-7",
@@ -201,16 +201,16 @@ def test_role_descriptions_are_supplied_without_expanding_the_whitelist():
         json.dumps(
             {
                 "track_id": "track-8",
-                "role": "caregiver",
+                "role": "facilitator",
                 "abstain": False,
             }
         )
     )
     assigner = QwenTrackRoleAssigner(
-        roles=("child", "caregiver"),
+        roles=("participant", "facilitator"),
         role_descriptions={
-            "child": "the infant participant",
-            "caregiver": "the adult participant",
+            "participant": "the person completing the task",
+            "facilitator": "the person presenting the materials",
         },
         transport=transport,
     )
@@ -223,9 +223,9 @@ def test_role_descriptions_are_supplied_without_expanding_the_whitelist():
     prompt_text = transport.calls[0]["payload"]["messages"][1]["content"][0][
         "text"
     ]
-    assert assignment.role == "caregiver"
-    assert "the infant participant" in prompt_text
-    assert "the adult participant" in prompt_text
+    assert assignment.role == "facilitator"
+    assert "the person completing the task" in prompt_text
+    assert "the person presenting the materials" in prompt_text
 
 
 def test_role_assignment_rejects_role_outside_whitelist():
@@ -242,7 +242,7 @@ def test_role_assignment_rejects_role_outside_whitelist():
 
     with pytest.raises(VLMResponseError, match="whitelisted role"):
         QwenTrackRoleAssigner(
-            roles=("child", "caregiver"),
+            roles=("participant", "facilitator"),
             transport=transport,
         ).assign_role("track-7", [EvidenceImage(b"frame")])
 
@@ -252,7 +252,7 @@ def test_fake_transport_captures_openai_request_and_secret_free_provenance():
         json.dumps(
             {
                 "track_id": "person-a",
-                "role": "child",
+                "role": "participant",
                 "abstain": False,
                 "confidence": 0.91,
             }
@@ -266,7 +266,7 @@ def test_fake_transport_captures_openai_request_and_secret_free_provenance():
         timeout_seconds=9,
     )
     assignment = QwenTrackRoleAssigner(
-        roles=("child", "caregiver"),
+        roles=("participant", "facilitator"),
         config=config,
         transport=transport,
     ).assign_role(
@@ -375,3 +375,5 @@ def test_quality_preset_selects_the_exact_qwen_model() -> None:
     assert preset["spatial"]["role_assignment"]["backend"] == (
         "qwen_track_role"
     )
+    assert "roles" not in preset["spatial"]["role_assignment"]
+    assert "role_descriptions" not in preset["spatial"]["role_assignment"]

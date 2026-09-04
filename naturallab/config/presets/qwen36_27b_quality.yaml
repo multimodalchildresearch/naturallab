@@ -1,6 +1,6 @@
 name: qwen36_27b_quality
-version: 2
-description: High-quality Qwen3.6-27B grounding and role-assignment workflow.
+version: 3
+description: Configured Qwen3.6-27B grounding and DeepSORT workflow.
 
 vlm_service:
   base_url_env: NATURALLAB_VLM_BASE_URL
@@ -53,9 +53,3 @@ spatial:
     prompt_version: qwen-track-role-assignment/v2
     evidence_images_per_track: 5
     allow_abstention: true
-    roles:
-      - child
-      - caregiver
-    role_descriptions:
-      child: the infant participant
-      caregiver: the adult caregiver participant

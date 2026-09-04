@@ -28,6 +28,8 @@ def test_runtime_provenance_is_json_safe_and_redacts_secrets(
     assert provenance["operation"] == "calibrate.verify"
     assert provenance["parameters"]["password"] == "<redacted>"
     assert provenance["parameters"]["nested"]["api_key"] == "<redacted>"
+    assert provenance["parameters"]["video"] == "<redacted-local-path>"
+    assert str(tmp_path) not in rendered
     assert provenance["software"]["naturallab"]
     assert provenance["software"]["python"]
     assert provenance["software"]["numpy"]

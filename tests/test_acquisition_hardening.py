@@ -11,11 +11,13 @@ import json
 import runpy
 import stat
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import cv2
 import numpy as np
+import pandas as pd
 import pytest
 
 from naturallab.acquisition import lsl_streams
@@ -120,6 +122,183 @@ def test_simple_streamer_requires_one_name_per_camera(monkeypatch):
         stream_synchronized_sensors.main()
 
 
+def test_simple_streamer_fails_when_requested_source_never_starts(
+    monkeypatch,
+    capsys,
+):
+    def stop_before_first_sample(_url, _name, _quality, worker_status=None):
+        assert worker_status is not None
+
+    monkeypatch.setattr(
+        stream_synchronized_sensors,
+        "stream_rtsp_camera",
+        stop_before_first_sample,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stream_synchronized_sensors.py",
+            "--cameras",
+            "rtsp://camera-one/live",
+            "--camera-names",
+            "camera-one",
+        ],
+    )
+
+    assert stream_synchronized_sensors.main() == 1
+    captured = capsys.readouterr()
+    assert "stopped before publishing its first sample" in captured.err
+    assert "no partial sensor set was accepted" in captured.out
+
+
+def test_simple_streamer_propagates_worker_failure_after_start(
+    monkeypatch,
+    capsys,
+):
+    def fail_after_first_sample(_url, _name, _quality, worker_status=None):
+        assert worker_status is not None
+        worker_status.mark_started()
+        time.sleep(0.1)
+        raise RuntimeError("fixture source disappeared")
+
+    monkeypatch.setattr(
+        stream_synchronized_sensors,
+        "stream_rtsp_camera",
+        fail_after_first_sample,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "stream_synchronized_sensors.py",
+            "--cameras",
+            "rtsp://camera-one/live",
+            "--camera-names",
+            "camera-one",
+        ],
+    )
+
+    assert stream_synchronized_sensors.main() == 1
+    captured = capsys.readouterr()
+    assert "fixture source disappeared" in captured.err
+    assert "Every requested stream published data" in captured.out
+
+
+def test_primary_recorder_rejects_a_required_source_without_a_first_sample(
+    monkeypatch,
+    capsys,
+):
+    def stop_without_publishing(
+        _url,
+        _name,
+        worker_status=None,
+    ):
+        assert worker_status is not None
+
+    monkeypatch.setattr(lsl_streams, "pylsl", object())
+    monkeypatch.setattr(
+        lsl_streams,
+        "stream_rtsp_to_lsl",
+        stop_without_publishing,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lsl_streams.py",
+            "--no-neon",
+            "--no-realsense",
+            "--no-audio",
+            "--no-imu",
+            "--rtsp-urls",
+            "rtsp://user:super-secret@192.0.2.10/live",
+            "--camera-names",
+            "room-camera",
+            "--startup-timeout-seconds",
+            "0.1",
+        ],
+    )
+
+    assert lsl_streams.main() == 1
+    captured = capsys.readouterr()
+    assert "stopped before publishing its first sample" in captured.err
+    assert "no partial sensor set was accepted" in captured.err
+    assert "super-secret" not in captured.out + captured.err
+    assert "192.0.2.10" not in captured.out + captured.err
+
+
+def test_primary_recorder_propagates_runtime_failure_without_leaking_rtsp_url(
+    monkeypatch,
+    capsys,
+):
+    def fail_after_publishing(_url, _name, worker_status=None):
+        assert worker_status is not None
+        worker_status.mark_published()
+        time.sleep(0.05)
+        raise RuntimeError(
+            "transport failed at rtsp://user:super-secret@192.0.2.10/live"
+        )
+
+    monkeypatch.setattr(lsl_streams, "pylsl", object())
+    monkeypatch.setattr(lsl_streams, "stream_rtsp_to_lsl", fail_after_publishing)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "lsl_streams.py",
+            "--no-neon",
+            "--no-realsense",
+            "--no-audio",
+            "--no-imu",
+            "--rtsp-urls",
+            "rtsp://user:super-secret@192.0.2.10/live",
+            "--camera-names",
+            "room-camera",
+        ],
+    )
+
+    assert lsl_streams.main() == 1
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "Every requested NaturalLab LSL source published data" in captured.out
+    assert "stopping the complete acquisition" in captured.err
+    assert "rtsp://[redacted]" in captured.err
+    assert "super-secret" not in combined
+    assert "192.0.2.10" not in combined
+
+
+def test_every_primary_non_audio_worker_marks_first_publication():
+    source = Path(lsl_streams.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    for function_name in (
+        "stream_realsense_to_lsl",
+        "stream_neon_api_to_lsl",
+        "stream_eye_events_to_lsl",
+        "stream_imu_to_lsl",
+        "stream_rtsp_to_lsl",
+    ):
+        calls = [
+            node
+            for node in ast.walk(functions[function_name])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_mark_worker_published"
+        ]
+        assert calls, function_name
+
+
+def test_missing_optional_eye_event_measurements_are_nan_not_zero():
+    assert np.isnan(lsl_streams._optional_float(SimpleNamespace(), "missing"))
+    assert lsl_streams._optional_float(SimpleNamespace(value=0), "value") == 0.0
+
+
 def test_legacy_plaintext_password_is_removed_on_load(tmp_path):
     config_path = tmp_path / "recording.json"
     config_path.write_text(
@@ -152,7 +331,7 @@ def test_legacy_plaintext_password_is_removed_on_load(tmp_path):
     assert "Removed a legacy plaintext RTSP password" in gui._config_migration_notice
 
 
-def test_rtsp_credentials_are_encoded_in_launched_urls_and_redacted_from_logs(
+def test_rtsp_credentials_use_private_stdin_pipe_and_never_process_arguments(
     tmp_path,
     monkeypatch,
 ):
@@ -189,13 +368,32 @@ def test_rtsp_credentials_are_encoded_in_launched_urls_and_redacted_from_logs(
 
     launched = {}
 
+    class PrivateInput:
+        def __init__(self):
+            self.parts = []
+            self.closed = False
+
+        def write(self, value):
+            self.parts.append(value)
+
+        def flush(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
     class Process:
         pid = 1234
+
+        def __init__(self):
+            self.stdin = PrivateInput()
 
     def fake_popen(command, **kwargs):
         launched["command"] = command
         launched["kwargs"] = kwargs
-        return Process()
+        process = Process()
+        launched["process"] = process
+        return process
 
     class Thread:
         def __init__(self, **kwargs):
@@ -209,19 +407,64 @@ def test_rtsp_credentials_are_encoded_in_launched_urls_and_redacted_from_logs(
 
     gui.start_lsl_streaming()
 
-    url_argument = launched["command"][
-        launched["command"].index("--rtsp-urls") + 1
-    ]
     assert launched["command"][0] == sys.executable
     assert "--eye-events" in launched["command"]
-    assert url_argument == (
-        "rtsp://lab%20user%40example.org:p%40ss%20word%2C%23@"
-        "192.0.2.10:554/main/stream"
-    )
+    assert "--rtsp-config-stdin" in launched["command"]
+    assert "--rtsp-urls" not in launched["command"]
+    assert "--camera-names" not in launched["command"]
+    assert launched["kwargs"]["stdin"] is recording_gui.subprocess.PIPE
+    private_payload = json.loads("".join(launched["process"].stdin.parts))
+    assert private_payload == {
+        "rtsp_urls": [
+            "rtsp://lab%20user%40example.org:p%40ss%20word%2C%23@"
+            "192.0.2.10:554/main/stream"
+        ],
+        "camera_names": ["Room camera"],
+    }
+    assert launched["process"].stdin.closed is True
     combined_log = "\n".join(messages)
     assert "p@ss word,#" not in combined_log
     assert "p%40ss%20word%2C%23" not in combined_log
-    assert "lab%20user%40example.org:***@192.0.2.10:554" in combined_log
+    assert "192.0.2.10" not in combined_log
+
+
+def test_private_rtsp_configuration_is_strictly_validated():
+    args = SimpleNamespace(
+        rtsp_config_stdin=True,
+        rtsp_urls="",
+        camera_names="",
+    )
+    stream = SimpleNamespace(
+        readline=lambda _limit: json.dumps(
+            {
+                "rtsp_urls": ["rtsp://user:secret@camera.invalid/live"],
+                "camera_names": ["Room camera"],
+            }
+        )
+        + "\n"
+    )
+
+    urls, names = lsl_streams._parse_rtsp_configuration(args, stream)
+
+    assert urls == ["rtsp://user:secret@camera.invalid/live"]
+    assert names == ["Room camera"]
+
+    duplicate_names = SimpleNamespace(
+        readline=lambda _limit: json.dumps(
+            {
+                "rtsp_urls": ["rtsp://one.invalid/live", "rtsp://two.invalid/live"],
+                "camera_names": ["same", "same"],
+            }
+        )
+        + "\n"
+    )
+    with pytest.raises(ValueError, match="unique"):
+        lsl_streams._parse_rtsp_configuration(args, duplicate_names)
+
+
+def test_helper_neon_missing_measurements_are_not_reported_as_zero():
+    assert np.isnan(stream_synchronized_sensors._optional_float(None))
+    assert stream_synchronized_sensors._optional_float(0.0) == 0.0
 
 
 def test_recorder_ignores_legacy_placeholder_addresses(
@@ -514,9 +757,26 @@ def test_disabling_neon_also_blocks_explicit_eye_event_start(monkeypatch):
 def test_eye_events_receive_the_configured_child_ip(monkeypatch):
     received_addresses = []
 
-    class FinishedThread:
-        def join(self, timeout=None):
-            return None
+    class Device:
+        def __init__(self, address, port):
+            self.address = address
+            self.phone_name = "Test Neon"
+            self.port = port
+
+    def publish_until_stopped(*_arguments, worker_status=None):
+        assert worker_status is not None
+        worker_status.mark_published()
+        while lsl_streams.running:
+            time.sleep(0.001)
+
+    def eye_events(address, worker_status=None):
+        received_addresses.append(address)
+        publish_until_stopped(worker_status=worker_status)
+
+    def finish_startup(workers, _timeout):
+        assert all(status.started.wait(1) for status, _thread in workers)
+        lsl_streams.running = False
+        return []
 
     monkeypatch.setattr(
         sys,
@@ -533,13 +793,25 @@ def test_eye_events_receive_the_configured_child_ip(monkeypatch):
     )
     monkeypatch.setattr(lsl_streams, "pylsl", object())
     monkeypatch.setattr(lsl_streams, "REALTIME_API_AVAILABLE", True)
-    monkeypatch.setattr(lsl_streams, "running", False)
+    monkeypatch.setitem(
+        sys.modules,
+        "pupil_labs.realtime_api.simple",
+        SimpleNamespace(Device=Device),
+    )
     monkeypatch.setattr(
         lsl_streams,
         "stream_eye_events_to_lsl",
-        lambda address: (
-            received_addresses.append(address) or FinishedThread()
-        ),
+        eye_events,
+    )
+    monkeypatch.setattr(
+        lsl_streams,
+        "stream_neon_api_to_lsl",
+        publish_until_stopped,
+    )
+    monkeypatch.setattr(
+        lsl_streams,
+        "_wait_for_worker_startup",
+        finish_startup,
     )
 
     assert lsl_streams.main() == 0
@@ -583,6 +855,13 @@ def test_bundled_streamer_fails_when_every_source_is_disabled(
 
     assert lsl_streams.main() == 1
     assert "no acquisition source started" in capsys.readouterr().err
+
+
+def test_discovered_neon_labels_never_guess_participant_roles():
+    assert lsl_streams._discovered_neon_label(0) == "Device1"
+    assert lsl_streams._discovered_neon_label(1) == "Device2"
+    with pytest.raises(ValueError):
+        lsl_streams._discovered_neon_label(-1)
 
 
 def test_free_form_process_output_redacts_every_rtsp_password():
@@ -659,6 +938,94 @@ def test_xdf_video_extraction_does_not_skip_a_corrupt_frame(tmp_path):
 
     assert not (tmp_path / "camera-01_timestamps.csv").exists()
     assert not (tmp_path / "camera-01.mp4").exists()
+
+
+def test_xdf_video_verifies_the_finalized_frame_count(tmp_path, monkeypatch):
+    image = np.zeros((32, 32, 3), dtype=np.uint8)
+    encoded_ok, encoded = cv2.imencode(".jpg", image)
+    assert encoded_ok
+    encoded_frame = base64.b64encode(encoded.tobytes()).decode("ascii")
+    stream = {
+        "info": {"name": ["camera-01"]},
+        "time_series": [[encoded_frame], [encoded_frame]],
+        "time_stamps": [1.0, 1.1],
+    }
+    real_video_writer = cv2.VideoWriter
+
+    class DroppingWriter:
+        def __init__(self, *arguments):
+            self.writer = real_video_writer(*arguments)
+            self.writes = 0
+
+        def isOpened(self):
+            return self.writer.isOpened()
+
+        def write(self, frame):
+            if self.writes == 0:
+                self.writer.write(frame)
+            self.writes += 1
+
+        def release(self):
+            self.writer.release()
+
+    monkeypatch.setattr(cv2, "VideoWriter", DroppingWriter)
+
+    with pytest.raises(RuntimeError, match="decoded 1 of 2 expected frames"):
+        xdf_extract.extract_video_stream(stream, tmp_path)
+
+    assert not (tmp_path / "camera-01.mp4").exists()
+    assert not (tmp_path / "camera-01_timestamps.csv").exists()
+
+
+def test_xdf_video_timestamp_failure_rolls_back_staged_media(
+    tmp_path,
+    monkeypatch,
+):
+    image = np.zeros((16, 16, 3), dtype=np.uint8)
+    encoded_ok, encoded = cv2.imencode(".jpg", image)
+    assert encoded_ok
+    encoded_frame = base64.b64encode(encoded.tobytes()).decode("ascii")
+    stream = {
+        "info": {"name": ["camera-01"]},
+        "time_series": [[encoded_frame]],
+        "time_stamps": [1.0],
+    }
+
+    class StagedWriter:
+        def __init__(self, path, *_arguments):
+            self.path = Path(path)
+            self.path.write_bytes(b"staged-video")
+
+        def isOpened(self):
+            return True
+
+        def write(self, _frame):
+            return None
+
+        def release(self):
+            return None
+
+    monkeypatch.setattr(cv2, "VideoWriter", StagedWriter)
+    monkeypatch.setattr(
+        xdf_extract,
+        "_verify_video_file",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pd.DataFrame,
+        "to_csv",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("fixture timestamp write failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="timestamp write failure"):
+        xdf_extract.extract_video_stream(stream, tmp_path)
+
+    assert not (tmp_path / "camera-01.mp4").exists()
+    assert not (tmp_path / "camera-01_timestamps.csv").exists()
+    assert not (tmp_path / ".camera-01.partial.mp4").exists()
+    assert not (tmp_path / ".camera-01_timestamps.partial.csv").exists()
 
 
 def test_save_config_never_persists_rtsp_password(tmp_path):
@@ -884,6 +1251,108 @@ def test_acquisition_sources_use_lsl_clock_domain_and_monotonic_fps():
             )
         else:
             assert not wall_clock_calls, source_path
+
+
+def test_simple_streamer_records_realsense_hardware_depth_scale(
+    monkeypatch,
+):
+    created_infos = []
+    created_outlets = []
+
+    class Description:
+        def __init__(self):
+            self.values = {}
+
+        def append_child_value(self, key, value):
+            self.values[key] = value
+            return self
+
+    class StreamInfo:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.description = Description()
+            created_infos.append(self)
+
+        def desc(self):
+            return self.description
+
+    class StreamOutlet:
+        def __init__(self, info):
+            self.info = info
+            self.samples = []
+            created_outlets.append(self)
+
+        def push_sample(self, sample, timestamp=None):
+            self.samples.append((sample, timestamp))
+
+    class Device:
+        def first_depth_sensor(self):
+            return SimpleNamespace(get_depth_scale=lambda: 0.0025)
+
+        def get_info(self, key):
+            return {"name": "Test RealSense", "serial": "0001"}[key]
+
+    class Pipeline:
+        def __init__(self):
+            self.stopped = False
+
+        def start(self, _config):
+            return SimpleNamespace(get_device=lambda: Device())
+
+        def stop(self):
+            self.stopped = True
+
+    pipeline = Pipeline()
+    fake_rs = SimpleNamespace(
+        pipeline=lambda: pipeline,
+        config=lambda: SimpleNamespace(enable_stream=lambda *_args: None),
+        stream=SimpleNamespace(color="color", depth="depth"),
+        format=SimpleNamespace(bgr8="bgr8", z16="z16"),
+        camera_info=SimpleNamespace(name="name", serial_number="serial"),
+    )
+    fake_pylsl = SimpleNamespace(
+        StreamInfo=StreamInfo,
+        StreamOutlet=StreamOutlet,
+        local_clock=lambda: 123.5,
+    )
+    monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
+    monkeypatch.setitem(sys.modules, "pylsl", fake_pylsl)
+    monkeypatch.setattr(stream_synchronized_sensors, "running", False)
+
+    stream_synchronized_sensors.stream_realsense()
+
+    depth_info = next(
+        info
+        for info in created_infos
+        if info.kwargs["name"] == "RealSense_Depth"
+    )
+    assert depth_info.description.values == {
+        "content": "raw_depth",
+        "depth_format": "uint16_device_units",
+        "depth_scale_m_per_unit": "0.0025",
+        "metric_unit": "metre",
+    }
+    metadata_outlet = next(
+        outlet
+        for outlet in created_outlets
+        if outlet.info.kwargs["name"] == "RealSense_Metadata"
+    )
+    metadata = json.loads(metadata_outlet.samples[0][0][0])
+    assert metadata["depth_scale_m_per_unit"] == 0.0025
+    assert metadata["raw_depth_unit"] == "device_depth_unit"
+    assert metadata["metric_unit"] == "metre"
+
+    depth_stream = {
+        "info": {
+            "name": ["RealSense_Depth"],
+            "desc": [depth_info.description.values],
+        }
+    }
+    assert xdf_extract._resolve_depth_scale(depth_stream, [depth_stream]) == (
+        0.0025,
+        "depth stream metadata",
+    )
+    assert pipeline.stopped is True
 
 
 def test_generated_labrecorder_config_uses_supported_key_value_format(tmp_path):

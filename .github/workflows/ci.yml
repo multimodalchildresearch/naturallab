@@ -39,8 +39,19 @@ jobs:
           assert len(archive) == 1, archive;
           names = tarfile.open(archive[0]).getnames();
           required = ('docs/lab_setup_guide.md',
+          'THIRD_PARTY_NOTICES.md',
           'examples/study_manifest.yaml',
           'scripts/track_people_in_video.py');
+          missing = [item for item in required if not any(name.endswith('/' +
+          item) for name in names)]; assert not missing, missing"
+
+      - name: Check wheel license and notice files
+        run: >-
+          python -c "import glob, zipfile;
+          archive = glob.glob('dist/*.whl');
+          assert len(archive) == 1, archive;
+          names = zipfile.ZipFile(archive[0]).namelist();
+          required = ('LICENSE', 'THIRD_PARTY_NOTICES.md');
           missing = [item for item in required if not any(name.endswith('/' +
           item) for name in names)]; assert not missing, missing"
 

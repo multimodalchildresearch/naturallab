@@ -42,6 +42,12 @@ has four required top-level fields:
 - `steps`: explicit selected/skipped steps, dependencies, inputs, outputs, and
   JSON-compatible configuration.
 
+Use pseudonymous study/session identifiers. Keep a real session manifest under
+the ignored `private-study-data/` directory, or in the study's access-controlled
+data store, whenever it contains private paths or participant-related metadata.
+The adjacent `*.run-state.json` files are also ignored by Git by default; do not
+override those safeguards when publishing code or filing an issue.
+
 All relative paths are resolved relative to the manifest file. Every selected
 step must declare at least one output so completion can be verified. A view
 requires `media`; calibration, role labels, object inputs, and gaze inputs are
@@ -106,12 +112,13 @@ produces OpenCV BGR arrays, `ImageDirectorySource` produces Pillow RGB images,
 and a custom source may produce either. Normalize image type and color space
 before passing it to a model that expects a specific representation.
 
-## 3. Build the current operational Qwen and DeepSORT path
+## 3. Build the supported Qwen and DeepSORT client path
 
-The packaged `qwen36_27b_quality` preset fixes the operational path to the exact
-model `Qwen/Qwen3.6-27B` for person grounding and post-tracking role
-assignment. It constructs Qwen person detection, DeepSORT temporal tracking,
-and a Qwen role assigner from one schema-validated configuration:
+The packaged `qwen36_27b_quality` preset configures the exact
+model `Qwen/Qwen3.6-27B` for person grounding and optional post-tracking role
+assignment. It constructs Qwen person detection and DeepSORT temporal tracking
+from one schema-validated configuration. Study roles are never embedded in the
+preset:
 
 Grounding requests contain complete frames and role-assignment requests contain
 cropped track images. Use an institutionally approved HTTPS service covered by
@@ -174,12 +181,24 @@ marked as temporal predictions, and cadence-skipped frames do not consume
 detector-age or gallery-expiry budget. Qwen confidence is nullable and remains
 nullable rather than being invented.
 
-`components.role_assigner` is separate from the per-frame pipeline. Apply it to
-representative evidence crops from a completed track when assigning roles such
-as `child` and `caregiver`. Its output can abstain. Do not equate a local
-DeepSORT track ID with a cross-camera identity. The preset exposes and enforces
-an upper bound of five evidence images per track; excess evidence is rejected
-instead of being silently truncated.
+`components.role_assigner` is `None` unless the caller supplies a non-empty
+mapping whose keys are the study's role names and whose values describe those
+roles:
+
+```python
+components = build_spatial_pipeline(
+    role_descriptions={
+        "participant": "the person completing the task",
+        "facilitator": "the person presenting the materials",
+    }
+)
+```
+
+The assigner is separate from the per-frame pipeline. Apply it to representative
+evidence crops from a completed track. Its output can abstain. Do not equate a
+local DeepSORT track ID with a cross-camera identity. The preset exposes and
+enforces an upper bound of five evidence images per track; excess evidence is
+rejected instead of being silently truncated.
 
 For tests, inject `transport`, `deep_sort_factory`, `feature_extractor`, or
 `feature_gallery` into `build_spatial_pipeline`. Injected runtimes do not
@@ -265,7 +284,7 @@ observations = [
         coordinate_frame=left_floor.coordinate_frame,
         source_floor_calibration_sha256=left_floor.sha256,
         units="mm",
-        shared_identity="child",
+        shared_identity="participant",
     ),
 ]
 
@@ -274,8 +293,12 @@ assert per_view.fusion_enabled is False
 metrics = per_view.per_view_metrics
 ```
 
-`per_view_metrics` groups by source view and local track. This is the safe
-default even after points have been transformed into the room frame.
+`per_view_metrics` groups by source view and local track, which avoids silently
+merging local identities after room registration. Its distance field is named
+`observed_chord_sum`: it sums straight-line chords between available adjacent
+observations. Because this API receives no expected sampling cadence, it also
+reports the maximum timestamp gap and marks path completeness as
+`unassessed_no_expected_cadence`; it does not claim a complete travelled path.
 
 Enable fusion only when the shared identity is independently justified and the
 timestamp tolerance is scientifically acceptable:
@@ -365,7 +388,7 @@ streams = {
             stream_id="people",
             record_id="track-frame-30",
             timestamp_seconds=1.000,
-            values={"role": "child"},
+            values={"role": "participant"},
         )
     ],
     "audio": [],

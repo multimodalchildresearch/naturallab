@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 from typing import Any, Optional, Sequence
 
 from naturallab.provenance import runtime_provenance
@@ -20,6 +23,7 @@ from .automatic import (
     load_calibration_bundle_file,
     load_intrinsic_artifact,
     save_annotated_detections,
+    source_identity,
     verify_floor_from_video,
     write_json_report,
     write_measurements_csv,
@@ -401,12 +405,113 @@ def _ensure_available(
 ) -> None:
     if overwrite:
         return
-    existing = [path for path in paths if path.exists()]
+    existing = [
+        path for path in paths if path.exists() or path.is_symlink()
+    ]
     if existing:
         rendered = ", ".join(str(path) for path in existing)
         raise AutomaticCalibrationError(
             f"output already exists: {rendered}; pass --overwrite to replace it"
         )
+
+
+def _remove_managed_path(path: Path) -> None:
+    """Remove one known output without following a directory symlink."""
+
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _create_staging_directory(output: Path, operation: str) -> Path:
+    """Create a same-filesystem staging directory for one command run."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".naturallab-{operation}-",
+            dir=str(output.parent),
+        )
+    )
+
+
+def _commit_staged_outputs(
+    *,
+    output: Path,
+    staging: Path,
+    managed: Sequence[Path],
+    produced: Sequence[Path],
+) -> None:
+    """Install a complete output set and restore the old set on failure.
+
+    ``managed`` includes outputs that this run intentionally omits.  Moving
+    every prior managed path to a same-filesystem backup before installation
+    both removes stale diagnostics and enforces mutual exclusion between the
+    operational and candidate room-registration artifacts.
+    """
+
+    managed_paths = tuple(Path(path) for path in managed)
+    produced_paths = tuple(Path(path) for path in produced)
+    for relative in (*managed_paths, *produced_paths):
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("managed calibration outputs must be relative")
+    if not set(produced_paths).issubset(set(managed_paths)):
+        raise ValueError("produced calibration outputs must be managed")
+    missing = [
+        relative
+        for relative in produced_paths
+        if not (staging / relative).exists()
+        and not (staging / relative).is_symlink()
+    ]
+    if missing:
+        raise AutomaticCalibrationError(
+            "staged calibration output is missing: "
+            + ", ".join(str(path) for path in missing)
+        )
+
+    output.mkdir(parents=True, exist_ok=True)
+    backup = Path(
+        tempfile.mkdtemp(
+            prefix=".naturallab-calibration-backup-",
+            dir=str(output.parent),
+        )
+    )
+    moved_old: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    try:
+        for relative in managed_paths:
+            destination = output / relative
+            if not destination.exists() and not destination.is_symlink():
+                continue
+            saved = backup / relative
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(destination, saved)
+            moved_old.append((destination, saved))
+
+        for relative in produced_paths:
+            source = staging / relative
+            destination = output / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source, destination)
+            installed.append(destination)
+    except Exception as commit_error:
+        try:
+            for destination in reversed(installed):
+                _remove_managed_path(destination)
+            for destination, saved in reversed(moved_old):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(saved, destination)
+        except Exception as rollback_error:
+            raise AutomaticCalibrationError(
+                "could not commit calibration outputs or restore the prior "
+                f"outputs; recovery backup retained at {backup}: "
+                f"{rollback_error}"
+            ) from commit_error
+        shutil.rmtree(backup)
+        raise
+    else:
+        shutil.rmtree(backup)
 
 
 def _attach_runtime_provenance(
@@ -551,9 +656,13 @@ def _run_intrinsic(args: argparse.Namespace) -> dict[str, Any]:
     report_path = output / "intrinsic-report.json"
     selected_path = output / "selected-views.csv"
     frame_directory = output / "intrinsic-selected-views"
-    targets = [artifact_path, report_path, selected_path]
-    if args.save_frames:
-        targets.append(frame_directory)
+    managed = (
+        Path("intrinsics.yaml"),
+        Path("intrinsic-report.json"),
+        Path("selected-views.csv"),
+        Path("intrinsic-selected-views"),
+    )
+    targets = [output / relative for relative in managed]
     _ensure_available(targets, overwrite=args.overwrite)
 
     run = calibrate_intrinsics_from_video(
@@ -574,34 +683,44 @@ def _run_intrinsic(args: argparse.Namespace) -> dict[str, Any]:
     report = dict(run.report)
     report["opencv_version"] = __import__("cv2").__version__
     report["outputs"] = {
-        "intrinsics": str(artifact_path),
-        "report": str(report_path),
-        "selected_views": str(selected_path),
+        "intrinsics": artifact_path.name,
+        "report": report_path.name,
+        "selected_views": selected_path.name,
     }
-    _attach_runtime_provenance(report, args)
-    write_yaml_artifact(
-        artifact_path,
-        run.artifact,
-        overwrite=args.overwrite,
-    )
-    write_json_report(report_path, report, overwrite=args.overwrite)
-    selected_rows = report["selected_views"]
-    write_measurements_csv(
-        selected_path,
-        selected_rows,
-        overwrite=args.overwrite,
-    )
     if args.save_frames:
-        save_annotated_detections(
-            args.video,
-            detections=run.selected_detections,
-            board=_board(args),
-            input_rotation=run.artifact.input_rotation,
-            output_directory=frame_directory,
-            overwrite=args.overwrite,
+        report["outputs"]["annotated_frames"] = frame_directory.name
+    _attach_runtime_provenance(report, args)
+    produced = list(managed[:3])
+    staging = _create_staging_directory(output, "intrinsic")
+    try:
+        write_yaml_artifact(
+            staging / "intrinsics.yaml",
+            run.artifact,
         )
-        report["outputs"]["annotated_frames"] = str(frame_directory)
-        write_json_report(report_path, report, overwrite=True)
+        write_json_report(staging / "intrinsic-report.json", report)
+        write_measurements_csv(
+            staging / "selected-views.csv",
+            report["selected_views"],
+        )
+        if args.save_frames:
+            save_annotated_detections(
+                args.video,
+                detections=run.selected_detections,
+                board=_board(args),
+                input_rotation=run.artifact.input_rotation,
+                output_directory=(
+                    staging / "intrinsic-selected-views"
+                ),
+            )
+            produced.append(Path("intrinsic-selected-views"))
+        _commit_staged_outputs(
+            output=output,
+            staging=staging,
+            managed=managed,
+            produced=produced,
+        )
+    finally:
+        _remove_managed_path(staging)
     if args.json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -616,9 +735,14 @@ def _run_floor(args: argparse.Namespace) -> dict[str, Any]:
     report_path = output / "floor-report.json"
     measurements_path = output / "floor-internal-measurements.csv"
     frame_directory = output / "floor-selected-placements"
-    targets = [artifact_path, bundle_path, report_path, measurements_path]
-    if args.save_frames:
-        targets.append(frame_directory)
+    managed = (
+        Path("floor.yaml"),
+        Path("calibration-bundle.yaml"),
+        Path("floor-report.json"),
+        Path("floor-internal-measurements.csv"),
+        Path("floor-selected-placements"),
+    )
+    targets = [output / relative for relative in managed]
     _ensure_available(targets, overwrite=args.overwrite)
 
     intrinsics = load_intrinsic_artifact(args.intrinsics)
@@ -643,45 +767,53 @@ def _run_floor(args: argparse.Namespace) -> dict[str, Any]:
     )
     report = dict(run.report)
     report["opencv_version"] = __import__("cv2").__version__
-    report["intrinsics_file"] = str(
-        Path(args.intrinsics).expanduser().resolve()
-    )
+    report["intrinsics_file"] = source_identity(args.intrinsics)
     report["outputs"] = {
-        "floor": str(artifact_path),
-        "bundle": str(bundle_path),
-        "report": str(report_path),
-        "internal_measurements": str(measurements_path),
+        "floor": artifact_path.name,
+        "bundle": bundle_path.name,
+        "report": report_path.name,
+        "internal_measurements": measurements_path.name,
     }
-    _attach_runtime_provenance(report, args)
-    write_yaml_artifact(
-        artifact_path,
-        run.artifact,
-        overwrite=args.overwrite,
-    )
-    write_yaml_document(
-        bundle_path,
-        bundle.to_dict(),
-        overwrite=args.overwrite,
-    )
-    write_json_report(report_path, report, overwrite=args.overwrite)
-    write_measurements_csv(
-        measurements_path,
-        run.internal_measurements,
-        overwrite=args.overwrite,
-    )
     if args.save_frames:
-        save_annotated_detections(
-            args.video,
-            detections=tuple(
-                pose.detection for pose in run.selected_poses
-            ),
-            board=_board(args),
-            input_rotation=intrinsics.input_rotation,
-            output_directory=frame_directory,
-            overwrite=args.overwrite,
+        report["outputs"]["annotated_frames"] = frame_directory.name
+    _attach_runtime_provenance(report, args)
+    produced = list(managed[:4])
+    staging = _create_staging_directory(output, "floor")
+    try:
+        write_yaml_artifact(
+            staging / "floor.yaml",
+            run.artifact,
         )
-        report["outputs"]["annotated_frames"] = str(frame_directory)
-        write_json_report(report_path, report, overwrite=True)
+        write_yaml_document(
+            staging / "calibration-bundle.yaml",
+            bundle.to_dict(),
+        )
+        write_json_report(staging / "floor-report.json", report)
+        write_measurements_csv(
+            staging / "floor-internal-measurements.csv",
+            run.internal_measurements,
+        )
+        if args.save_frames:
+            save_annotated_detections(
+                args.video,
+                detections=tuple(
+                    pose.detection for pose in run.selected_poses
+                ),
+                board=_board(args),
+                input_rotation=intrinsics.input_rotation,
+                output_directory=(
+                    staging / "floor-selected-placements"
+                ),
+            )
+            produced.append(Path("floor-selected-placements"))
+        _commit_staged_outputs(
+            output=output,
+            staging=staging,
+            managed=managed,
+            produced=produced,
+        )
+    finally:
+        _remove_managed_path(staging)
     if args.json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -697,15 +829,14 @@ def _run_extrinsics(args: argparse.Namespace) -> dict[str, Any]:
     )
     report_path = output / "extrinsics-report.json"
     observations_path = output / "shared-observations.csv"
-    frame_directory = output / "annotated-placements"
-    targets = [
-        registration_path,
-        candidate_registration_path,
-        report_path,
-        observations_path,
-    ]
-    if args.save_frames:
-        targets.append(frame_directory)
+    managed = (
+        Path("room-registration.yaml"),
+        Path("candidate-room-registration.yaml"),
+        Path("extrinsics-report.json"),
+        Path("shared-observations.csv"),
+        Path("annotated-placements"),
+    )
+    targets = [output / relative for relative in managed]
     _ensure_available(targets, overwrite=args.overwrite)
 
     run = calibrate_extrinsics_from_manifest(args.manifest)
@@ -714,44 +845,66 @@ def _run_extrinsics(args: argparse.Namespace) -> dict[str, Any]:
         registration_path = candidate_registration_path
     report["opencv_version"] = __import__("cv2").__version__
     report["outputs"] = {
-        "room_registration": str(registration_path),
-        "report": str(report_path),
-        "shared_observations": str(observations_path),
+        "room_registration": registration_path.name,
+        "report": report_path.name,
+        "shared_observations": observations_path.name,
     }
     _attach_runtime_provenance(report, args)
-    write_yaml_document(
-        registration_path,
-        run.room_registration.to_dict(),
-        overwrite=args.overwrite,
-    )
-    write_json_report(report_path, report, overwrite=args.overwrite)
-    write_measurements_csv(
-        observations_path,
-        run.observations,
-        overwrite=args.overwrite,
-    )
-    if args.save_frames:
-        frame_outputs = {}
-        views = {
-            view.view_id: view for view in run.manifest.views
-        }
-        for view_id, detections in (
-            run.selected_detections_by_view.items()
-        ):
-            view_directory = frame_directory / view_id
-            written = save_annotated_detections(
-                views[view_id].video_path,
-                detections=detections,
-                board=run.manifest.board,
-                input_rotation=run.bundles_by_view[
-                    view_id
-                ].input_rotation,
-                output_directory=view_directory,
-                overwrite=args.overwrite,
-            )
-            frame_outputs[view_id] = [str(path) for path in written]
-        report["outputs"]["annotated_frames"] = frame_outputs
-        write_json_report(report_path, report, overwrite=True)
+    registration_name = Path(registration_path.name)
+    produced = [
+        registration_name,
+        Path("extrinsics-report.json"),
+        Path("shared-observations.csv"),
+    ]
+    staging = _create_staging_directory(output, "extrinsics")
+    try:
+        write_yaml_document(
+            staging / registration_name,
+            run.room_registration.to_dict(),
+        )
+        write_measurements_csv(
+            staging / "shared-observations.csv",
+            run.observations,
+        )
+        if args.save_frames:
+            frame_outputs = {}
+            views = {
+                view.view_id: view for view in run.manifest.views
+            }
+            for view_id, detections in (
+                run.selected_detections_by_view.items()
+            ):
+                staged_view_directory = (
+                    staging / "annotated-placements" / view_id
+                )
+                written = save_annotated_detections(
+                    views[view_id].video_path,
+                    detections=detections,
+                    board=run.manifest.board,
+                    input_rotation=run.bundles_by_view[
+                        view_id
+                    ].input_rotation,
+                    output_directory=staged_view_directory,
+                )
+                final_view_directory = Path("annotated-placements") / view_id
+                frame_outputs[view_id] = [
+                    str(final_view_directory / path.name)
+                    for path in written
+                ]
+            report["outputs"]["annotated_frames"] = frame_outputs
+            produced.append(Path("annotated-placements"))
+        write_json_report(
+            staging / "extrinsics-report.json",
+            report,
+        )
+        _commit_staged_outputs(
+            output=output,
+            staging=staging,
+            managed=managed,
+            produced=produced,
+        )
+    finally:
+        _remove_managed_path(staging)
     if args.json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
@@ -764,9 +917,12 @@ def _run_verify(args: argparse.Namespace) -> dict[str, Any]:
     report_path = output / "verification.json"
     measurements_path = output / "measurements.csv"
     frame_directory = output / "annotated-placements"
-    targets = [report_path, measurements_path]
-    if args.save_frames:
-        targets.append(frame_directory)
+    managed = (
+        Path("verification.json"),
+        Path("measurements.csv"),
+        Path("annotated-placements"),
+    )
+    targets = [output / relative for relative in managed]
     _ensure_available(targets, overwrite=args.overwrite)
 
     if args.bundle:
@@ -776,7 +932,7 @@ def _run_verify(args: argparse.Namespace) -> dict[str, Any]:
             )
         bundle = load_calibration_bundle_file(args.bundle)
         calibration_inputs = {
-            "bundle_file": str(Path(args.bundle).expanduser().resolve())
+            "bundle_file": source_identity(args.bundle)
         }
     else:
         if not args.intrinsics or not args.floor:
@@ -785,10 +941,8 @@ def _run_verify(args: argparse.Namespace) -> dict[str, Any]:
             )
         bundle = load_calibration_bundle(args.intrinsics, args.floor)
         calibration_inputs = {
-            "intrinsics_file": str(
-                Path(args.intrinsics).expanduser().resolve()
-            ),
-            "floor_file": str(Path(args.floor).expanduser().resolve()),
+            "intrinsics_file": source_identity(args.intrinsics),
+            "floor_file": source_identity(args.floor),
         }
     run = verify_floor_from_video(
         args.video,
@@ -808,28 +962,38 @@ def _run_verify(args: argparse.Namespace) -> dict[str, Any]:
     report["opencv_version"] = __import__("cv2").__version__
     report.update(calibration_inputs)
     report["outputs"] = {
-        "report": str(report_path),
-        "measurements": str(measurements_path),
+        "report": report_path.name,
+        "measurements": measurements_path.name,
     }
-    _attach_runtime_provenance(report, args)
-    write_json_report(report_path, report, overwrite=args.overwrite)
-    write_measurements_csv(
-        measurements_path,
-        run.measurements,
-        overwrite=args.overwrite,
-    )
     if args.save_frames:
-        save_annotated_detections(
-            args.video,
-            detections=run.selected_detections,
-            board=_board(args),
-            input_rotation=bundle.input_rotation,
-            output_directory=frame_directory,
-            measurements=run.measurements,
-            overwrite=args.overwrite,
+        report["outputs"]["annotated_frames"] = frame_directory.name
+    _attach_runtime_provenance(report, args)
+    produced = list(managed[:2])
+    staging = _create_staging_directory(output, "verify")
+    try:
+        write_measurements_csv(
+            staging / "measurements.csv",
+            run.measurements,
         )
-        report["outputs"]["annotated_frames"] = str(frame_directory)
-        write_json_report(report_path, report, overwrite=True)
+        if args.save_frames:
+            save_annotated_detections(
+                args.video,
+                detections=run.selected_detections,
+                board=_board(args),
+                input_rotation=bundle.input_rotation,
+                output_directory=staging / "annotated-placements",
+                measurements=run.measurements,
+            )
+            produced.append(Path("annotated-placements"))
+        write_json_report(staging / "verification.json", report)
+        _commit_staged_outputs(
+            output=output,
+            staging=staging,
+            managed=managed,
+            produced=produced,
+        )
+    finally:
+        _remove_managed_path(staging)
     if args.json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:

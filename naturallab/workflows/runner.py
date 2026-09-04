@@ -8,6 +8,7 @@ from typing import Callable, Dict, Mapping, Optional, Tuple, Union
 
 from .manifest import StepSpec, StudyManifest
 from .state import (
+    FailureRecord,
     RunState,
     RunStateError,
     StepRunState,
@@ -193,14 +194,16 @@ class WorkflowRunner:
                 )
             for path, fingerprint in current_outputs.items():
                 fingerprints[
-                    f"dependency.{dependency_name}.output.{path}"
+                    f"dependency.{dependency_name}.{path}"
                 ] = fingerprint
         return fingerprints
 
     def _output_fingerprints(self, step: StepSpec) -> Dict[str, str]:
         return {
-            path: fingerprint_path(self.manifest.resolve_path(path))
-            for path in step.outputs
+            f"output.{index}": fingerprint_path(
+                self.manifest.resolve_path(path)
+            )
+            for index, path in enumerate(step.outputs)
         }
 
     def _can_resume(
@@ -222,7 +225,8 @@ class WorkflowRunner:
             return False
         return (
             bool(outputs)
-            and set(outputs) == set(step.outputs)
+            and set(outputs)
+            == {f"output.{index}" for index in range(len(step.outputs))}
             and outputs == persisted.output_fingerprints
         )
 
@@ -271,16 +275,17 @@ class WorkflowRunner:
             try:
                 input_fingerprints = self._input_fingerprints(step, state)
             except Exception as exc:
+                failure = FailureRecord.from_exception(exc)
                 persisted.status = StepStatus.FAILED
-                persisted.error = str(exc)
+                persisted.error = failure
                 persisted.completed_at = None
                 persisted.output_fingerprints = {}
                 state.write_atomic(self.state_path)
                 if isinstance(exc, WorkflowExecutionError):
-                    raise
+                    raise WorkflowExecutionError(failure.message) from exc
                 raise WorkflowExecutionError(
                     f"could not fingerprint inputs for step {step.name!r}: "
-                    f"{exc}"
+                    f"{failure.message}"
                 ) from exc
 
             if self._can_resume(
@@ -307,10 +312,11 @@ class WorkflowRunner:
             try:
                 executor = self._executor_for(executors, step.name)
             except WorkflowExecutionError as exc:
+                failure = FailureRecord.from_exception(exc)
                 persisted.status = StepStatus.FAILED
-                persisted.error = str(exc)
+                persisted.error = failure
                 state.write_atomic(self.state_path)
-                raise
+                raise WorkflowExecutionError(failure.message) from exc
 
             persisted.status = StepStatus.RUNNING
             persisted.attempts += 1
@@ -332,21 +338,26 @@ class WorkflowRunner:
             try:
                 executor(context)
                 output_fingerprints = self._output_fingerprints(step)
-                if set(output_fingerprints) != set(step.outputs):
+                expected_output_keys = {
+                    f"output.{index}"
+                    for index in range(len(step.outputs))
+                }
+                if set(output_fingerprints) != expected_output_keys:
                     raise WorkflowExecutionError(
                         f"step {step.name!r} did not produce exactly its "
                         "declared outputs"
                     )
             except Exception as exc:
+                failure = FailureRecord.from_exception(exc)
                 persisted.status = StepStatus.FAILED
-                persisted.error = str(exc)
+                persisted.error = failure
                 persisted.completed_at = None
                 persisted.output_fingerprints = {}
                 state.write_atomic(self.state_path)
                 if isinstance(exc, WorkflowExecutionError):
-                    raise
+                    raise WorkflowExecutionError(failure.message) from exc
                 raise WorkflowExecutionError(
-                    f"step {step.name!r} failed: {exc}"
+                    f"step {step.name!r} failed: {failure.message}"
                 ) from exc
 
             persisted.output_fingerprints = output_fingerprints

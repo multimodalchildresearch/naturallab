@@ -3,6 +3,12 @@
 NaturalLab is a research pipeline for person tracking, room-scale movement,
 egocentric object detection, gaze analysis, and multimodal sensor data.
 
+Version 0.1.0 is the initial research-software release. APIs may change as the
+project develops. Passing the software checks does not by itself validate
+measurement accuracy: calibration quality, timing, detector performance, and
+hardware behavior must be verified for each recording setup. General 3D
+skeleton or arbitrary-point triangulation is not part of this release.
+
 The repository is being consolidated into task-oriented workflows. The current
 foundation is usable for a guided recording setup, environment checks, external
 video input, automatic camera calibration, person tracking, Qwen person
@@ -34,7 +40,7 @@ millisecond-accurate capture synchronization.
 | Workflow | Current entry point | Status |
 |---|---|---|
 | Check an installation | `naturallab doctor` | Ready |
-| Configure cameras/sensors and open LabRecorder | `naturallab record` | Ready on a desktop with Tk; four shared-credential camera rows |
+| Configure cameras/sensors and open LabRecorder | `naturallab record` | Hardware-specific dyadic Neon compatibility workflow; four shared-credential camera rows; desktop with Tk required |
 | Validate, plan, or inspect a study manifest | `naturallab study` | Ready, read-only CLI |
 | Read arbitrary video, image sequences, or Python frame iterables | `naturallab.media` | Ready as a library API |
 | Track people in a video with YOLO, OWLv2, or Qwen | `scripts/track_people_in_video.py` | Compatibility CLI |
@@ -52,6 +58,12 @@ calls the same implementation. See the
 [researcher workflow guide](docs/researcher_workflow.md) for the study manifest,
 Qwen/DeepSORT preset, camera registration and fusion boundaries, gaze
 assignment, multimodal alignment, and safe resume behavior.
+
+The packaged recording window reflects the current laboratory hardware: its
+Neon controls and optional eye-event stream are explicitly Child/Caregiver
+dyadic. It must not be presented as a role-general recorder. Existing-video
+analysis, caller-defined tracking roles, camera calibration, and multiview
+registration are independent of that acquisition convention.
 
 ## Install and check
 
@@ -77,6 +89,7 @@ Install only the workflow dependencies you need:
 
 ```bash
 python -m pip install -e ".[spatial]"
+python -m pip install -e ".[yolo]"  # separately licensed optional YOLO path
 python -m pip install -e ".[gaze]"
 python -m pip install -e ".[acquisition]"
 python -m pip install -e ".[qwen]"  # Qwen + required DeepSORT/OSNet runtime
@@ -88,6 +101,9 @@ python -m pip install -e ".[all,dev]"
 The acquisition extra covers LSL, XDF, and timestamped Pupil Labs streams.
 Intel RealSense additionally requires a platform-compatible `pyrealsense2`
 installation. NaturalLab commands do not install packages at runtime.
+NaturalLab's MIT license does not relicense optional dependencies or model
+weights. In particular, review [the third-party notices](THIRD_PARTY_NOTICES.md)
+before installing or using the Ultralytics YOLO path.
 
 ## External footage is a first-class input
 
@@ -138,8 +154,8 @@ python scripts/track_people_in_video.py \
   --device auto
 ```
 
-The current operational Qwen path uses an OpenAI-compatible service hosting the
-exact model `Qwen/Qwen3.6-27B`:
+The currently supported Qwen client path uses an OpenAI-compatible service
+hosting the exact model `Qwen/Qwen3.6-27B`:
 
 ```bash
 export NATURALLAB_VLM_BASE_URL="https://your-institutional-service.example/v1"
@@ -156,13 +172,14 @@ python scripts/track_people_in_video.py \
 ```
 
 The repository provides the client adapter; it does not launch or download the
-27-billion-parameter model. The client sends complete frames for grounding and
-cropped track images for role assignment. Use only an institutionally approved
-HTTPS endpoint whose data handling is covered by the study's consent and data
-protection arrangements; a loopback HTTP endpoint is appropriate only when the
-service runs on the same machine. Non-loopback HTTP is rejected unless the
-researcher explicitly sets `NATURALLAB_ALLOW_INSECURE_VLM_HTTP=1`. Qwen
-detections use normalized `xyxy` coordinates,
+27-billion-parameter model. The client sends complete frames for grounding and,
+when role assignment is requested, cropped track images. Use only an
+institutionally approved HTTPS endpoint whose data handling is covered by the
+study's consent and data protection arrangements; a loopback HTTP endpoint is
+appropriate only when the service runs on the same machine. Non-loopback HTTP
+is rejected unless the researcher explicitly sets
+`NATURALLAB_ALLOW_INSECURE_VLM_HTTP=1`. Qwen detections use normalized `xyxy`
+coordinates,
 strict JSON validation, and nullable confidence rather than invented scores.
 Reported scores below `--confidence` are removed; detections whose score is
 null are retained and remain visibly null. Frames between Qwen calls are marked
@@ -179,12 +196,15 @@ python scripts/track_people_in_video.py \
   --output results \
   --detector qwen \
   --tracker deepsort \
-  --identities '{"child":"the infant participant","caregiver":"the adult participant"}'
+  --identities '{"participant":"the person completing the task","facilitator":"the person presenting the materials"}'
 ```
 
-The operational preset accepts at most five evidence images per track and
-exposes that limit as `components.role_assigner.evidence_images_per_track`.
-Supplying more is rejected rather than silently discarding evidence.
+The packaged preset does not contain study roles. Library callers request a
+role assigner explicitly with
+`build_spatial_pipeline(role_descriptions={"participant": "..."})`; without
+that mapping, `components.role_assigner` is `None`. The configured assigner
+accepts at most five evidence images per track. Supplying more is rejected
+rather than silently discarding evidence.
 
 Outputs are written below `results/<video-name>/`:
 
@@ -192,7 +212,12 @@ Outputs are written below `results/<video-name>/`:
   prediction flag, and optional floor coordinates.
 - `track_statistics.csv`: track span, separate observed/predicted counts, and
   first-to-last elapsed time plus distance totals with an explicit unit field
-  when calibration is available.
+  when calibration is available. Distance is the sum of every finite
+  consecutive projected displacement; no cadence-dependent step filter or
+  empirical multiplier is applied. Projection attempts, valid projections,
+  contiguous gaps, coverage, and `distance_status` make incomplete metric paths
+  explicit. Timestamp provenance distinguishes container, synthesized, mixed,
+  missing, and non-monotonic timing instead of treating them as equivalent.
 - `run_metadata.json`: detector settings, processed-frame count, and persisted
   detection provenance.
 - `identity_matches.json`: role, abstention, reason, and Qwen provenance when
@@ -253,10 +278,10 @@ additionally requires a shared room registration. NaturalLab can recover it
 from a manifest of shared stationary-board recordings; it never infers
 geometry from camera count alone.
 
-Versioned artifacts reject hidden distance correction factors and mismatched
+Versioned artifacts preserve one explicit metric scale and reject mismatched
 camera IDs, hashes, image sizes, rotations, or coordinate frames. The tracking
 compatibility script can still read the repository's older `dist_coeffs` and
-`plane_normal`/`plane_d` files.
+`plane_normal`/`plane_d` files without rescaling their measurements.
 
 Read the full [automatic calibration workflow](docs/calibration_workflow.md)
 before recording.
@@ -300,13 +325,20 @@ reference photos or deciding to train a separate model.
 ## Qwen preset and reproducibility
 
 The packaged preset
-`naturallab/config/presets/qwen36_27b_quality.yaml` records the current
-operational model, deployment-defined service precision, Qwen grounding and
-role assignment, detection cadence, and the intended DeepSORT temporal backend. The
-`build_spatial_pipeline()` factory validates this preset and constructs Qwen
-grounding, strict DeepSORT/OSNet tracking, and Qwen role assignment. The
+`naturallab/config/presets/qwen36_27b_quality.yaml` records the configured
+model, deployment-defined service precision, Qwen grounding,
+detection cadence, role-assignment backend settings, and the intended DeepSORT
+temporal backend. The `build_spatial_pipeline()` factory validates this preset
+and constructs Qwen grounding plus strict DeepSORT/OSNet tracking. It constructs
+a Qwen role assigner only from caller-supplied role descriptions. The
 compatibility tracking script keeps Kalman as its default and exposes the same
 preset-driven DeepSORT path with `--tracker deepsort`.
+
+DeepSORT diagnostics are off by default. Library callers who explicitly enable
+them must provide a new or empty `diagnostics_output_dir`; the public diagnostic
+path writes a text log only, never participant crops or annotated frames.
+Provenance records this policy and only the output directory's basename, not an
+absolute local path.
 
 The preset-driven factory uses the official OSNet-AIN x1.0 MSMT17 checkpoint
 pinned to one immutable `kaiyangzhou/osnet` revision, byte size, and SHA-256. On first
@@ -353,7 +385,9 @@ The remaining implementation order is:
 3. Stable installed console subcommands and task-oriented demo data.
 4. A guided analysis UI beyond the existing recording window.
 
-NaturalLab is licensed under the MIT License. Clone the public repository from
+NaturalLab's own source is licensed under the MIT License; dependencies and
+model weights retain their own terms, as summarized in the
+[third-party notices](THIRD_PARTY_NOTICES.md). Clone the public repository from
 [multimodalchildresearch/naturallab](https://github.com/multimodalchildresearch/naturallab)
 and report reproducible software problems through its
 [issue tracker](https://github.com/multimodalchildresearch/naturallab/issues).

@@ -12,6 +12,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_PUBLIC_FILES = (
     "README.md",
     "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
     "docs/quickstart.md",
     "docs/lab_setup_guide.md",
     "docs/object_detection_guide.md",
@@ -30,13 +31,29 @@ PROHIBITED_DOCUMENTATION_PHRASES = (
 )
 
 PROHIBITED_LEGACY_MODULES = (
+    "naturallab/acquisition/combine_streams.py",
+    "naturallab/acquisition/gaze_visualizer.py",
     "naturallab/utils/granularity.py",
+    "naturallab/utils/h5.py",
+    "naturallab/utils/misc.py",
+    "naturallab/utils/vision.py",
     "naturallab/gaze_analysis/object_detection/two_stage.py",
+    "naturallab/spatial_tracking/distance/distance_utils.py",
+    "naturallab/spatial_tracking/movement/movement_analyzer.py",
+    "naturallab/spatial_tracking/pose/pose_estimator.py",
+    "naturallab/spatial_tracking/tracking/category_tracker.py",
     "naturallab/spatial_tracking/tracking/track_identity_matching.py",
+    "naturallab/spatial_tracking/visualization/visualizer.py",
 )
 
 CLONE_COMMAND_PATTERN = re.compile(
     r"(?im)^\s*git\s+clone\s+(https://github\.com/[^\s`]+)"
+)
+PROJECT_VERSION_PATTERN = re.compile(
+    r'(?m)^version\s*=\s*"([^"]+)"\s*$'
+)
+MODULE_VERSION_PATTERN = re.compile(
+    r'(?m)^__version__\s*=\s*"([^"]+)"\s*$'
 )
 WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 PRIVATE_PATH_MARKERS = (
@@ -83,6 +100,46 @@ def test_study_specific_legacy_modules_are_not_shipped() -> None:
     assert not present, "Study-specific legacy modules remain: " + ", ".join(
         present
     )
+
+
+def test_release_version_is_consistent() -> None:
+    project_text = (REPOSITORY_ROOT / "pyproject.toml").read_text("utf-8")
+    module_text = (REPOSITORY_ROOT / "naturallab/__init__.py").read_text(
+        "utf-8"
+    )
+    project_match = PROJECT_VERSION_PATTERN.search(project_text)
+    module_match = MODULE_VERSION_PATTERN.search(module_text)
+
+    assert project_match is not None
+    assert module_match is not None
+    assert project_match.group(1) == module_match.group(1)
+
+
+def test_public_license_does_not_use_blind_review_placeholder() -> None:
+    license_text = (REPOSITORY_ROOT / "LICENSE").read_text("utf-8")
+
+    assert "Anonymous Authors" not in license_text
+    assert "NaturalLab contributors" in license_text
+
+
+def test_wheel_metadata_includes_third_party_notices() -> None:
+    project_text = (REPOSITORY_ROOT / "pyproject.toml").read_text("utf-8")
+
+    assert 'license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]' in project_text
+
+
+def test_yolo_is_a_separate_optional_extra_with_a_license_notice() -> None:
+    project_text = (REPOSITORY_ROOT / "pyproject.toml").read_text("utf-8")
+    spatial_extra = project_text.split("spatial = [", 1)[1].split("]", 1)[0]
+    tracking_extra = project_text.split("tracking = [", 1)[1].split("]", 1)[0]
+    yolo_extra = project_text.split("yolo = [", 1)[1].split("]", 1)[0]
+    notice = (REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md").read_text("utf-8")
+
+    assert "ultralytics" not in spatial_extra
+    assert "ultralytics" not in tracking_extra
+    assert '"ultralytics>=8.0.0"' in yolo_extra
+    assert "Ultralytics" in notice
+    assert "AGPL-3.0" in notice
 
 
 def test_extrinsics_report_source_does_not_claim_triangulation_support() -> None:
@@ -161,3 +218,16 @@ def test_public_docs_and_examples_do_not_embed_private_paths() -> None:
                 )
 
     assert not failures, "Private paths in public files: " + ", ".join(failures)
+
+
+def test_generated_run_state_and_adjacent_files_are_ignored() -> None:
+    ignore_patterns = set(
+        (REPOSITORY_ROOT / ".gitignore").read_text("utf-8").splitlines()
+    )
+
+    assert {
+        "*.run-state.json",
+        "run-state.json",
+        "*run-state.json.lock",
+        ".*run-state.json.*.tmp",
+    } <= ignore_patterns

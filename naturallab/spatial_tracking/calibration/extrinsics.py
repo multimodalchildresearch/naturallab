@@ -1849,7 +1849,7 @@ def calibrate_extrinsics_from_manifest(
             view.view_id: {
                 "camera_id": bundles[view.view_id].camera_id,
                 "video": video_identities[view.view_id],
-                "calibration_bundle": str(view.bundle_path),
+                "calibration_bundle": source_identity(view.bundle_path),
                 "intrinsic_sha256": bundles[
                     view.view_id
                 ].intrinsics.sha256,

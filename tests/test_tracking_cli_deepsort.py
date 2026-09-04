@@ -113,11 +113,20 @@ def test_deepsort_helper_applies_overrides_through_quality_factory() -> None:
                     "reid_device": "cuda",
                     "allow_reid_fallback": True,
                 },
-                "reid_model": {
-                    "reid_backend": "histogram",
-                    "fallback_allowed": True,
-                    "fallback_used": True,
-                },
+                    "reid_model": {
+                        "reid_backend": "histogram",
+                        "fallback_allowed": True,
+                        "fallback_used": True,
+                    },
+                    "diagnostics": {
+                        "enabled": False,
+                        "path_policy": (
+                            "explicit_new_or_empty_directory_required"
+                        ),
+                        "output_directory_name": None,
+                        "persisted_content": "none",
+                        "persists_images": False,
+                    },
             }
 
     def fake_pipeline_builder(**kwargs):
@@ -148,12 +157,21 @@ def test_deepsort_helper_applies_overrides_through_quality_factory() -> None:
             "reid_device": "cuda",
             "allow_reid_fallback": True,
         },
-        "reid_model": {
-            "reid_backend": "histogram",
-            "fallback_allowed": True,
-            "fallback_used": True,
-        },
-    }
+            "reid_model": {
+                "reid_backend": "histogram",
+                "fallback_allowed": True,
+                "fallback_used": True,
+            },
+            "diagnostics": {
+                "enabled": False,
+                "path_policy": (
+                    "explicit_new_or_empty_directory_required"
+                ),
+                "output_directory_name": None,
+                "persisted_content": "none",
+                "persists_images": False,
+            },
+        }
 
 
 def test_deepsort_helper_keeps_fallback_disabled_by_default() -> None:

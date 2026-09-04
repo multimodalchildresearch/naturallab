@@ -9,6 +9,7 @@ from typing import Any, Dict
 import pytest
 
 from naturallab.workflows import (
+    FailureRecord,
     RunState,
     RunStateError,
     StepExecutionContext,
@@ -221,8 +222,103 @@ def test_executor_exception_is_persisted_as_failed_and_can_resume(
 
     state = RunState.load(tmp_path / "run-state.json")
     assert state.steps["track"].status is StepStatus.FAILED
-    assert state.steps["track"].error == "synthetic model failure"
+    assert state.steps["track"].error == FailureRecord(
+        type="RuntimeError",
+        message="synthetic model failure",
+    )
     assert state.steps["summarize"].status is StepStatus.PENDING
+
+
+def test_failure_state_redacts_paths_endpoints_secrets_and_is_bounded(
+    tmp_path: Path,
+) -> None:
+    create_inputs(tmp_path)
+    runner = make_runner(tmp_path)
+    private_path = tmp_path / "researcher-name" / "subject.csv"
+    secret = "private-token-value-123"
+    endpoint = "https://user:password@login.example.org:8443/private"
+
+    def fail(context: StepExecutionContext) -> None:
+        raise RuntimeError(
+            f"could not read {private_path}; token={secret}; "
+            f"endpoint={endpoint}; " + "diagnostic " * 100
+        )
+
+    with pytest.raises(WorkflowExecutionError) as caught:
+        runner.run({"track": fail})
+
+    raw_state = (tmp_path / "run-state.json").read_text(encoding="utf-8")
+    state = RunState.load(tmp_path / "run-state.json")
+    failure = state.steps["track"].error
+    assert failure is not None
+    assert failure.type == "RuntimeError"
+    assert len(failure.message) <= 320
+    assert "[truncated]" in failure.message
+    assert "<path:subject.csv>" in failure.message
+    assert "<endpoint>" in failure.message
+    assert "<redacted-secret>" in failure.message
+    for sensitive in (str(tmp_path), "researcher-name", secret, endpoint):
+        assert sensitive not in raw_state
+        assert sensitive not in str(caught.value)
+
+
+def test_run_state_uses_logical_fingerprint_keys_not_declared_paths(
+    tmp_path: Path,
+) -> None:
+    create_inputs(tmp_path)
+    runner = make_runner(tmp_path)
+
+    runner.run(content_executor([]))
+
+    raw_state = (tmp_path / "run-state.json").read_text(encoding="utf-8")
+    state = RunState.load(tmp_path / "run-state.json")
+    assert set(state.steps["track"].output_fingerprints) == {"output.0"}
+    assert "dependency.track.output.0" in (
+        state.steps["summarize"].input_fingerprints
+    )
+    assert "derived/tracks.json" not in raw_state
+    assert str(tmp_path) not in raw_state
+
+
+def test_legacy_state_is_sanitized_before_rewrite(tmp_path: Path) -> None:
+    digest = "0" * 64
+    legacy = {
+        "schema_version": "1.0",
+        "study_id": "study-01",
+        "session_id": "session-01",
+        "manifest_fingerprint": digest,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "steps": {
+            "track": {
+                "status": "failed",
+                "attempts": 1,
+                "config_fingerprint": digest,
+                "input_fingerprints": {
+                    "/Users/researcher/private/input.bin": digest,
+                },
+                "output_fingerprints": {
+                    "/Users/researcher/private/output.json": digest,
+                },
+                "started_at": None,
+                "completed_at": None,
+                "error": (
+                    "failed /Users/researcher/private/input.bin "
+                    "password=do-not-store"
+                ),
+            }
+        },
+    }
+
+    state = RunState.from_dict(legacy)
+    target = tmp_path / "session.run-state.json"
+    state.write_atomic(target)
+
+    payload = target.read_text(encoding="utf-8")
+    assert "/Users/" not in payload
+    assert "do-not-store" not in payload
+    assert "<path:input.bin>" in payload
+    assert "<redacted-secret>" in payload
+    assert "legacy." in payload
 
 
 def test_stale_completion_is_invalidated_when_executor_is_missing(

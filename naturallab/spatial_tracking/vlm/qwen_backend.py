@@ -357,7 +357,7 @@ def _provenance(
 
 
 class QwenPersonGrounder:
-    """Person grounder backed by Qwen3.6-27B through a local HTTP service."""
+    """Person grounder using Qwen3.6-27B through a configured service."""
 
     def __init__(
         self,

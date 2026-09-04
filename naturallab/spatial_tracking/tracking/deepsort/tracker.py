@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from typing import Dict, List, Tuple, Any, Optional
 from scipy.spatial.distance import cdist
@@ -35,7 +37,8 @@ class DeepSORTTracker(BaseTracker):
                  keep_lost_timeout: int = 60,  # Keep lost tracks longer
                  min_features_for_reid: int = 5,  # Minimum features required for reliable ReID
                  confidence_growth_rate: float = 0.05,  # Track confidence growth rate
-                 enable_diagnostics: bool = True,
+                 enable_diagnostics: bool = False,
+                 diagnostics_output_dir: Optional[str | os.PathLike[str]] = None,
                  reid_device: str = 'cpu',
                  allow_reid_fallback: bool = False,
                  require_reid_model: Optional[bool] = None,
@@ -54,7 +57,9 @@ class DeepSORTTracker(BaseTracker):
             keep_lost_timeout: How long to keep lost tracks for ReID purposes
             min_features_for_reid: Minimum number of features needed for reliable ReID
             confidence_growth_rate: Rate at which track confidence grows with continuous tracking
-            enable_diagnostics: Whether to enable diagnostic logging
+            enable_diagnostics: Whether to enable opt-in diagnostic logging
+            diagnostics_output_dir: Explicit new or empty directory for the
+                text-only diagnostic log. Required when diagnostics are enabled
             reid_device: Device used by the ReID feature extractor
             allow_reid_fallback: Explicitly allow histogram features if the
                 model cannot be loaded during construction
@@ -67,6 +72,17 @@ class DeepSORTTracker(BaseTracker):
         self.name = "DeepSORTTracker"  # Override name from BaseTracker
         if not isinstance(allow_reid_fallback, bool):
             raise TypeError("allow_reid_fallback must be a boolean")
+        if not isinstance(enable_diagnostics, bool):
+            raise TypeError("enable_diagnostics must be a boolean")
+        if enable_diagnostics and diagnostics_output_dir is None:
+            raise ValueError(
+                "enable_diagnostics=True requires an explicit "
+                "diagnostics_output_dir"
+            )
+        if not enable_diagnostics and diagnostics_output_dir is not None:
+            raise ValueError(
+                "diagnostics_output_dir requires enable_diagnostics=True"
+            )
         if require_reid_model is not None:
             if not isinstance(require_reid_model, bool):
                 raise TypeError("require_reid_model must be a boolean or None")
@@ -159,17 +175,26 @@ class DeepSORTTracker(BaseTracker):
             )
         )
         
-        # Initialize diagnostics
+        # Diagnostics are opt-in because tracking inputs can contain identifiable
+        # participant imagery. The public diagnostics path persists text only.
         self.enable_diagnostics = enable_diagnostics
         if enable_diagnostics:
             self.diagnostics = DeepSORTDiagnostics(
                 feature_extractor=self.feature_extractor,
                 feature_gallery=self.feature_gallery,
-                output_dir="deepsort_diagnostics"
+                output_dir=diagnostics_output_dir,
             )
             self.diagnostics.verify_model()
+            self.diagnostics_provenance = dict(self.diagnostics.provenance)
         else:
             self.diagnostics = None
+            self.diagnostics_provenance = {
+                "enabled": False,
+                "path_policy": "explicit_new_or_empty_directory_required",
+                "output_directory_name": None,
+                "persisted_content": "none",
+                "persists_images": False,
+            }
         
         # New parameters for improved tracking
         self.keep_lost_timeout = keep_lost_timeout

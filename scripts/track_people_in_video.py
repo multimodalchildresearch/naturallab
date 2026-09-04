@@ -3,15 +3,9 @@
 Track People in Video
 =====================
 
-A general-purpose script for tracking people in any video file.
-Outputs movement trajectories, distances traveled, and interaction metrics.
-
-Use Cases:
-- Behavioral research (any population)
-- Retail analytics (customer movement)
-- Sports analysis (player tracking)
-- Security/surveillance analysis
-- Occupancy monitoring
+A general-purpose script for tracking people in conventional video files.
+It writes image-space trajectories and, when calibrated, floor-plane path
+lengths. Qwen can optionally assign caller-defined semantic roles to tracks.
 
 Example Usage:
     # Basic tracking
@@ -22,7 +16,7 @@ Example Usage:
         --camera-calib calibration/camera-01/intrinsic/intrinsics.yaml \\
         --floor-calib calibration/camera-01/floor/floor.yaml
     
-    # With identity labels
+    # With caller-defined semantic roles
     python track_people_in_video.py --input video.mp4 --output results/ \\
         --identities '{"Person A": "person wearing red", "Person B": "person in blue"}'
 """
@@ -79,6 +73,17 @@ STATISTICS_OUTPUT_COLUMNS = (
     "covered_frame_count",
     "duration_seconds",
     "timing_basis",
+    "timestamp_validation_status",
+    "timestamp_source_kinds",
+)
+FLOOR_STATISTICS_OUTPUT_COLUMNS = (
+    "floor_projection_attempts",
+    "floor_projection_valid",
+    "floor_projection_missed",
+    "floor_projection_gap_count",
+    "floor_projection_coverage",
+    "distance_complete",
+    "distance_status",
 )
 
 
@@ -173,6 +178,22 @@ def prepare_video_output(destination, *, overwrite):
     destination.mkdir(parents=True, exist_ok=True)
 
 
+def write_annotated_tracking_frame(destination, frame):
+    """Write one requested diagnostic frame or raise a useful I/O error."""
+
+    import cv2
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        written = cv2.imwrite(str(destination), frame)
+    except Exception as error:
+        raise OSError(
+            f"could not encode annotated frame {destination}: {error}"
+        ) from error
+    if not written:
+        raise OSError(f"could not encode annotated frame {destination}")
+
+
 def probe_video(video_path):
     """Return nominal metadata only when at least one frame can be decoded."""
 
@@ -248,25 +269,31 @@ def write_track_tables(video_output, all_tracks, *, fps, floor_tracker):
                 fps,
             )
 
-            # Use the floor tracker's filtered accumulator so an explicit
-            # legacy correction factor is reflected in the export.
-            if (
-                floor_tracker is not None
-                and "floor_x" in track_dataframe.columns
-                and track_dataframe["floor_x"].notna().any()
-            ):
-                distance = floor_tracker.get_distance(track_id)
-                add_distance_statistics(
-                    statistic,
-                    distance,
-                    floor_tracker.units,
+            # Use every consecutive projected displacement in the calibration
+            # artifact's declared metric unit.
+            if floor_tracker is not None:
+                projection_summary = (
+                    floor_tracker.get_projection_summary(track_id)
                 )
+                statistic.update(projection_summary)
+                if projection_summary["floor_projection_valid"]:
+                    distance = floor_tracker.get_distance(track_id)
+                    add_distance_statistics(
+                        statistic,
+                        distance,
+                        floor_tracker.units,
+                    )
             statistics.append(statistic)
 
     statistics_dataframe = pd.DataFrame(statistics)
     if statistics_dataframe.empty:
+        empty_statistics_columns = list(STATISTICS_OUTPUT_COLUMNS)
+        if floor_tracker is not None:
+            empty_statistics_columns.extend(
+                FLOOR_STATISTICS_OUTPUT_COLUMNS
+            )
         statistics_dataframe = pd.DataFrame(
-            columns=STATISTICS_OUTPUT_COLUMNS
+            columns=empty_statistics_columns
         )
     statistics_dataframe.to_csv(
         video_output / "track_statistics.csv",
@@ -275,7 +302,7 @@ def write_track_tables(video_output, all_tracks, *, fps, floor_tracker):
     return dataframe, statistics_dataframe
 
 
-def load_floor_tracker(camera_calib_path, floor_calib_path, correction_factor=1.0):
+def load_floor_tracker(camera_calib_path, floor_calib_path):
     """Load a validated canonical pair or explicitly migrate legacy YAML."""
     import numpy as np
     import yaml
@@ -286,14 +313,6 @@ def load_floor_tracker(camera_calib_path, floor_calib_path, correction_factor=1.
         IntrinsicCalibrationArtifact,
     )
     from naturallab.spatial_tracking.movement.floor_tracker import SimpleFloorTracker
-
-    if (
-        isinstance(correction_factor, bool)
-        or not isinstance(correction_factor, (int, float))
-        or not math.isfinite(correction_factor)
-        or correction_factor <= 0
-    ):
-        raise ValueError("correction_factor must be a finite positive number")
 
     with open(camera_calib_path, encoding="utf-8") as handle:
         camera_data = yaml.safe_load(handle)
@@ -309,11 +328,6 @@ def load_floor_tracker(camera_calib_path, floor_calib_path, correction_factor=1.
     )
     calibration_bundle = None
     if uses_artifact_contract:
-        if correction_factor != 1.0:
-            raise ValueError(
-                "--correction-factor is a legacy option and cannot be applied "
-                "to versioned calibration artifacts"
-            )
         intrinsics = IntrinsicCalibrationArtifact.from_dict(camera_data)
         floor = FloorPlaneCalibrationArtifact.from_dict(
             floor_data,
@@ -352,11 +366,56 @@ def load_floor_tracker(camera_calib_path, floor_calib_path, correction_factor=1.
         camera_matrix=np.asarray(camera_matrix, dtype=float),
         dist_coeffs=np.asarray(dist_coeffs, dtype=float),
         floor_plane=np.asarray(floor_plane, dtype=float),
-        correction_factor=correction_factor,
         units=units,
     )
     tracker.calibration_bundle = calibration_bundle
     return tracker
+
+
+def floor_metric_provenance(floor_tracker):
+    """Describe the scale and accumulation rule used for distance outputs."""
+
+    if floor_tracker is None:
+        return None
+    value = {
+        "units": floor_tracker.units,
+        "scale_source": (
+            "canonical-calibration"
+            if floor_tracker.calibration_bundle is not None
+            else "legacy-calibration-values"
+        ),
+        "distance_accumulation": (
+            "all_finite_consecutive_floor_displacements"
+        ),
+        "projection_gap_policy": (
+            "bridge_valid_endpoints_and_mark_distance_partial"
+        ),
+        "completeness_output": "per-track track_statistics.csv fields",
+        "per_update_filter": None,
+    }
+    if floor_tracker.calibration_bundle is not None:
+        bundle = floor_tracker.calibration_bundle
+        value.update(
+            {
+                "camera_id": bundle.camera_id,
+                "intrinsic_sha256": bundle.intrinsics.sha256,
+                "floor_sha256": bundle.floor_plane.sha256,
+            }
+        )
+    return value
+
+
+def configured_role_evidence_limit():
+    """Return the evidence-image limit from the packaged quality preset."""
+
+    from naturallab.spatial_tracking.pipeline import (
+        load_spatial_pipeline_preset,
+    )
+
+    return (
+        load_spatial_pipeline_preset()
+        .role_assignment.evidence_images_per_track
+    )
 
 
 def prepare_frame_for_calibration(frame, floor_tracker):
@@ -554,30 +613,68 @@ def summarize_track_records(track_id, track_df, fps):
         "covered_frame_count": covered_frame_count,
         "duration_seconds": span_frames / fps if fps > 0 else None,
         "timing_basis": "nominal_fps" if fps > 0 else None,
+        "timestamp_validation_status": "not_available",
+        "timestamp_source_kinds": "",
     }
     if "timestamp_seconds" in track_df.columns:
         ordered_rows = track_df.sort_values("frame")
-        endpoint_timestamps = ordered_rows["timestamp_seconds"].iloc[
-            [0, -1]
-        ]
-        if endpoint_timestamps.notna().all():
-            first_timestamp = float(
-                endpoint_timestamps.iloc[0]
+        timestamp_values = []
+        timestamps_valid = True
+        for raw_timestamp in ordered_rows["timestamp_seconds"]:
+            try:
+                timestamp = float(raw_timestamp)
+            except (TypeError, ValueError):
+                timestamps_valid = False
+                break
+            if isinstance(raw_timestamp, bool) or not math.isfinite(timestamp):
+                timestamps_valid = False
+                break
+            timestamp_values.append(timestamp)
+
+        source_kinds = []
+        if "timestamp_source" in ordered_rows.columns:
+            for raw_source in ordered_rows["timestamp_source"]:
+                source = (
+                    raw_source.strip()
+                    if isinstance(raw_source, str) and raw_source.strip()
+                    else "unspecified"
+                )
+                if source not in source_kinds:
+                    source_kinds.append(source)
+        else:
+            source_kinds.append("unspecified")
+        stat["timestamp_source_kinds"] = "|".join(source_kinds)
+
+        if not timestamps_valid:
+            stat["timestamp_validation_status"] = "missing_or_nonfinite"
+        elif any(
+            current < previous
+            for previous, current in zip(
+                timestamp_values,
+                timestamp_values[1:],
             )
-            last_timestamp = float(
-                endpoint_timestamps.iloc[-1]
-            )
-            if last_timestamp >= first_timestamp:
-                stat["first_timestamp_seconds"] = first_timestamp
-                stat["last_timestamp_seconds"] = last_timestamp
-                stat["duration_seconds"] = last_timestamp - first_timestamp
-                stat["timing_basis"] = "source_timestamps"
+        ):
+            stat["timestamp_validation_status"] = "nonmonotonic"
+        else:
+            first_timestamp = timestamp_values[0]
+            last_timestamp = timestamp_values[-1]
+            stat["first_timestamp_seconds"] = first_timestamp
+            stat["last_timestamp_seconds"] = last_timestamp
+            stat["duration_seconds"] = last_timestamp - first_timestamp
+            stat["timestamp_validation_status"] = "valid"
+            if len(source_kinds) == 1:
+                stat["timing_basis"] = (
+                    f"source_timestamps:{source_kinds[0]}"
+                )
+            else:
+                stat["timing_basis"] = "mixed_source_timestamps"
     return stat
 
 
 def build_argument_parser():
     """Build the compatibility tracking CLI parser."""
 
+    role_evidence_limit = configured_role_evidence_limit()
     parser = argparse.ArgumentParser(
         description="Track people in video and extract movement metrics",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -605,7 +702,7 @@ def build_argument_parser():
         default="yolo",
         help="Person detector (qwen is the preferred quality path)",
     )
-    parser.add_argument("--yolo-model", default="yolo11x.pt",
+    parser.add_argument("--yolo-model", default="yolo11n.pt",
                        help="Path to YOLO model weights")
     parser.add_argument("--confidence", type=float, default=0.5,
                        help="Detection confidence threshold (default: 0.5)")
@@ -621,16 +718,6 @@ def build_argument_parser():
                        help="Camera calibration file (YAML)")
     parser.add_argument("--floor-calib",
                        help="Floor calibration file (YAML)")
-    # Retained only so historical command lines using unversioned calibration
-    # files continue to run. Canonical artifacts reject any value other than
-    # 1.0, and this option is intentionally absent from researcher-facing help.
-    parser.add_argument(
-        "--correction-factor",
-        type=float,
-        default=1.0,
-        help=argparse.SUPPRESS,
-    )
-    
     # Identity matching (optional)
     parser.add_argument("--identities", type=str,
                        help='JSON dict of identity descriptions, e.g., \'{"Coach": "person in red", "Player": "person in white"}\'')
@@ -639,9 +726,13 @@ def build_argument_parser():
     parser.add_argument(
         "--identity-evidence-frames",
         type=int,
-        default=5,
-        help="Representative crops supplied to Qwen per track (default: 5)",
+        default=role_evidence_limit,
+        help=(
+            "Representative crops supplied to Qwen per track "
+            f"(maximum: {role_evidence_limit})"
+        ),
     )
+    parser.set_defaults(_identity_evidence_limit=role_evidence_limit)
     
     # Tracking settings
     parser.add_argument(
@@ -692,8 +783,6 @@ def build_argument_parser():
     )
     
     # Output options
-    parser.add_argument("--visualize", action="store_true",
-                       help="Reserved; use --save-frames in this compatibility script")
     parser.add_argument("--save-frames", action="store_true",
                        help="Save sample frames with annotations")
     parser.add_argument("--frame-interval", type=int, default=100,
@@ -708,15 +797,14 @@ def build_argument_parser():
         default="auto",
         help="Local model device (default: auto)",
     )
-    parser.add_argument("--batch-size", type=int, default=1,
-                       help="Reserved for detector adapters (default: 1)")
-
     return parser
 
 
 def validate_cli_args(parser, args):
     """Validate argument combinations before any files or models are touched."""
 
+    if args.identities and args.identity_file:
+        parser.error("use either --identities or --identity-file, not both")
     if bool(args.camera_calib) != bool(args.floor_calib):
         parser.error("--camera-calib and --floor-calib must be provided together")
     if args.allow_reid_fallback and args.tracker != "deepsort":
@@ -725,10 +813,6 @@ def validate_cli_args(parser, args):
         )
     if args.reid_model is not None and args.tracker != "deepsort":
         parser.error("--reid-model is valid only with --tracker deepsort")
-    if args.visualize:
-        print("Warning: --visualize is not implemented yet; use --save-frames")
-    if args.batch_size != 1:
-        print("Warning: --batch-size is reserved for a future detector adapter")
     if args.qwen_cadence < 1:
         parser.error("--qwen-cadence must be positive")
     if (
@@ -744,13 +828,13 @@ def validate_cli_args(parser, args):
         args.min_hits = 1 if args.detector == "qwen" else 3
     elif args.min_hits < 1:
         parser.error("--min-hits must be positive")
-    if (
-        not math.isfinite(args.correction_factor)
-        or args.correction_factor <= 0
-    ):
-        parser.error("--correction-factor must be a finite positive number")
     if args.identity_evidence_frames < 1:
         parser.error("--identity-evidence-frames must be positive")
+    if args.identity_evidence_frames > args._identity_evidence_limit:
+        parser.error(
+            "--identity-evidence-frames cannot exceed the quality preset "
+            f"limit of {args._identity_evidence_limit}"
+        )
     if args.max_frames is not None and args.max_frames < 1:
         parser.error("--max-frames must be positive when provided")
 
@@ -829,6 +913,7 @@ def tracker_run_provenance(args, components=None):
         "backend": pipeline_provenance["tracker_backend"],
         "parameters": pipeline_provenance["tracker_parameters"],
         "reid_model": pipeline_provenance["reid_model"],
+        "diagnostics": pipeline_provenance["diagnostics"],
     }
 
 
@@ -847,13 +932,16 @@ def main(argv=None):
         print(f"Error: Output path is not a directory: {output_path}")
         return 1
 
-    # Load identity descriptions if provided
+    # Load role descriptions if provided.
     identities = None
-    if args.identities:
-        identities = json.loads(args.identities)
-    elif args.identity_file:
-        with open(args.identity_file, encoding="utf-8") as f:
-            identities = json.load(f)
+    try:
+        if args.identities:
+            identities = json.loads(args.identities)
+        elif args.identity_file:
+            with open(args.identity_file, encoding="utf-8") as f:
+                identities = json.load(f)
+    except (OSError, json.JSONDecodeError) as error:
+        parser.error(f"could not read role descriptions: {error}")
     if identities is not None and (
         not isinstance(identities, dict)
         or not identities
@@ -1041,7 +1129,6 @@ def main(argv=None):
             floor_tracker = load_floor_tracker(
                 args.camera_calib,
                 args.floor_calib,
-                correction_factor=args.correction_factor
             )
         
         # Actual decoding goes through the common FrameSource contract so
@@ -1150,7 +1237,6 @@ def main(argv=None):
             # Save sample frames if requested
             if args.save_frames and frame_idx % args.frame_interval == 0:
                 frame_path = video_output / "frames" / f"frame_{frame_idx:06d}.jpg"
-                frame_path.parent.mkdir(exist_ok=True)
                 # Draw tracks on frame
                 annotated = frame.copy()
                 for track in tracks:
@@ -1158,7 +1244,14 @@ def main(argv=None):
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(annotated, f"ID: {track['id']}",
                                (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.imwrite(str(frame_path), annotated)
+                try:
+                    write_annotated_tracking_frame(frame_path, annotated)
+                except OSError as error:
+                    shutil.rmtree(video_output)
+                    print(
+                        f"  Error: {error}; no result directory was kept."
+                    )
+                    return 1
             
             frames_processed += 1
 
@@ -1190,7 +1283,7 @@ def main(argv=None):
             "device": args.device,
         }
         if args.detector == "yolo":
-            detector_settings["model_path"] = args.yolo_model
+            detector_settings["model_path"] = Path(args.yolo_model).name
         if args.detector == "qwen":
             detector_settings["detection_cadence_frames"] = (
                 args.qwen_cadence
@@ -1202,13 +1295,16 @@ def main(argv=None):
         ) as handle:
             json.dump(
                 {
-                    "input_video": str(video_path),
+                    "input_video": video_path.name,
                     "detector": args.detector,
                     "detector_settings": detector_settings,
                     "detection_provenance": detection_provenance,
                     "tracker": args.tracker,
                     "tracker_provenance": tracker_provenance,
                     "reid_provenance": tracker_provenance["reid_model"],
+                    "metric_tracking": floor_metric_provenance(
+                        floor_tracker
+                    ),
                     "frames_processed": frames_processed,
                     "timestamp_sources": sorted(timestamp_sources),
                 },

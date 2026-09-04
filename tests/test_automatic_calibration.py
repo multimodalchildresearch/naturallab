@@ -26,6 +26,7 @@ from naturallab.spatial_tracking.calibration.automatic import (
     group_stationary_detections,
     measure_board_on_plane,
     select_diverse_detections,
+    source_identity,
     verify_floor_from_video,
 )
 
@@ -119,6 +120,104 @@ def test_board_dimensions_are_internal_corners_without_subtraction() -> None:
     assert board.pattern_size == (7, 7)
     assert board.corner_count == 49
     assert board.object_points()[-1].tolist() == [180.0, 180.0, 0.0]
+
+
+def test_source_identity_is_stable_and_does_not_expose_local_paths(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "participant-bearing-name.mp4"
+    source.write_bytes(b"same calibration bytes")
+
+    identity = source_identity(source)
+    rendered = repr(identity)
+
+    assert identity["size_bytes"] == len(b"same calibration bytes")
+    assert len(identity["sha256"]) == 64
+    assert str(tmp_path) not in rendered
+    assert source.name not in rendered
+    assert set(identity) == {"size_bytes", "sha256"}
+
+
+def test_video_scan_rejects_materially_incomplete_decode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class PartialCapture:
+        def __init__(self, _path: str) -> None:
+            self.decoded = 0
+            self.released = False
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, property_id: int) -> float:
+            if property_id == cv2.CAP_PROP_FPS:
+                return 25.0
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return 100.0
+            raise AssertionError(f"unexpected property: {property_id}")
+
+        def read(self):
+            if self.decoded == 3:
+                return False, None
+            self.decoded += 1
+            return True, np.zeros((16, 16, 3), dtype=np.uint8)
+
+        def release(self) -> None:
+            self.released = True
+
+    video = tmp_path / "truncated.mp4"
+    video.write_bytes(b"fixture")
+    monkeypatch.setattr(cv2, "VideoCapture", PartialCapture)
+    monkeypatch.setattr(
+        automatic,
+        "detect_chessboard_corners",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(
+        AutomaticCalibrationError,
+        match="ended early after 3 of 100 reported frames",
+    ):
+        automatic.scan_calibration_video(
+            video,
+            board=BoardSpec(7, 7, 30.0),
+        )
+
+
+def test_video_scan_rejects_unknown_reported_frame_count(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class UnknownLengthCapture:
+        def __init__(self, _path: str) -> None:
+            pass
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, property_id: int) -> float:
+            if property_id == cv2.CAP_PROP_FPS:
+                return 25.0
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return 0.0
+            raise AssertionError(f"unexpected property: {property_id}")
+
+        def release(self) -> None:
+            pass
+
+    video = tmp_path / "unknown-length.mp4"
+    video.write_bytes(b"fixture")
+    monkeypatch.setattr(cv2, "VideoCapture", UnknownLengthCapture)
+
+    with pytest.raises(
+        AutomaticCalibrationError,
+        match="trustworthy positive frame count",
+    ):
+        automatic.scan_calibration_video(
+            video,
+            board=BoardSpec(7, 7, 30.0),
+        )
 
 
 def test_stationary_grouping_uses_whole_run_and_tolerates_one_miss() -> None:

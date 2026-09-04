@@ -385,9 +385,19 @@ def test_default_keeps_per_view_observations_and_metrics_independent() -> None:
     assert len(result.per_view_observations["left"]) == 2
     assert len(result.per_view_observations["right"]) == 1
     metrics = {metric.source_view_id: metric for metric in result.per_view_metrics}
-    assert metrics["left"].path_length == 5.0
+    assert metrics["left"].observed_chord_sum == 5.0
+    assert metrics["left"].chord_count == 1
+    assert metrics["left"].maximum_timestamp_gap_ns == 10
+    assert metrics["left"].path_completeness == (
+        "unassessed_no_expected_cadence"
+    )
     assert metrics["left"].observation_count == 2
-    assert metrics["right"].path_length == 0.0
+    assert metrics["right"].observed_chord_sum == 0.0
+    assert metrics["right"].chord_count == 0
+    assert metrics["right"].maximum_timestamp_gap_ns is None
+    assert metrics["right"].path_completeness == (
+        "unassessed_no_expected_cadence"
+    )
     assert metrics["right"].observation_count == 1
 
 

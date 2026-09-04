@@ -103,7 +103,7 @@ Outputs:
 | File | Meaning |
 |---|---|
 | `intrinsics.yaml` | Canonical schema-v1 intrinsic artifact |
-| `intrinsic-report.json` | Source path, size, modification time and SHA-256; selected frames; coverage/perspective gates; true OpenCV RMS; per-view errors; and internal holdout diagnostic |
+| `intrinsic-report.json` | Path-free source size and SHA-256 identity; selected frames; coverage/perspective gates; true OpenCV RMS; per-view errors; and internal holdout diagnostic |
 | `selected-views.csv` | One row per accepted view |
 | `intrinsic-selected-views/` | Optional annotated detections |
 
@@ -230,13 +230,13 @@ sampling:
   time_tolerance_seconds: 0.15
 views:
   - view_id: camera-01
-    video: extracted/shared-board/camera-01.mp4
+    video: extracted/shared-board/camera_01.mp4
     calibration_bundle: calibration/camera-01/floor/calibration-bundle.yaml
-    timestamp_csv: extracted/shared-board/camera-01_timestamps.csv
+    timestamp_csv: extracted/shared-board/camera_01_timestamps.csv
   - view_id: camera-03
-    video: extracted/shared-board/camera-03.mp4
+    video: extracted/shared-board/camera_03.mp4
     calibration_bundle: calibration/camera-03/floor/calibration-bundle.yaml
-    timestamp_csv: extracted/shared-board/camera-03_timestamps.csv
+    timestamp_csv: extracted/shared-board/camera_03_timestamps.csv
 ```
 
 For videos extracted from one XDF, supply the matching timestamp CSV generated
@@ -359,10 +359,10 @@ calibration is sufficient for floor contact points and trajectories.
 
 ## Failure messages
 
-Quality and input failures are detected before calibration artifacts are
-written. Individual files use atomic replacement, although the complete
-multi-file output directory is not one filesystem transaction. The commands
-stop when they find:
+Quality and input failures are detected before calibration artifacts replace a
+successful result. Commands stage the complete managed output set on the same
+filesystem, then publish it together; a failure removes staged output and
+preserves the prior managed set. The commands stop when they find:
 
 - an unreadable or empty video;
 - invalid frame rate or changing frame dimensions;

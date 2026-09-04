@@ -4,17 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "naturallab"
-version = "1.0.0"
+version = "0.1.0"
 description = "Multi-modal tracking and analysis tools for developmental research"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [
   { name = "NaturalLab contributors" },
 ]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Science/Research",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
@@ -41,22 +41,19 @@ Issues = "https://github.com/multimodalchildresearch/naturallab/issues"
 [project.optional-dependencies]
 spatial = [
   "filterpy>=1.4.5",
-  "matplotlib>=3.3.0",
-  "mediapipe>=0.10.0",
   "scipy>=1.5.0",
   "torch>=1.13.0",
   "torchvision>=0.14.0",
   "transformers>=4.46.0",
-  "ultralytics>=8.0.0",
 ]
 tracking = [
   "filterpy>=1.4.5",
-  "matplotlib>=3.3.0",
-  "mediapipe>=0.10.0",
   "scipy>=1.5.0",
   "torch>=1.13.0",
   "torchvision>=0.14.0",
   "transformers>=4.46.0",
+]
+yolo = [
   "ultralytics>=8.0.0",
 ]
 gaze = [
@@ -84,7 +81,6 @@ all = [
   "filterpy>=1.4.5",
   "h5py>=3.0.0",
   "matplotlib>=3.3.0",
-  "mediapipe>=0.10.0",
   "pylsl>=1.16.0",
   "pupil-labs-realtime-api>=1.7.1",
   "pyxdf>=1.16.0",

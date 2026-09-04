@@ -34,16 +34,16 @@ quality_limits:
 
 views:
   - view_id: camera-01
-    video: ../extracted/shared-board/camera-01.mp4
+    video: ../extracted/shared-board/camera_01.mp4
     calibration_bundle: ../calibration/camera-01/floor/calibration-bundle.yaml
     # The extractor writes this beside the MP4. NaturalLab derives the
     # relative start offset automatically from its first timestamp.
-    timestamp_csv: ../extracted/shared-board/camera-01_timestamps.csv
+    timestamp_csv: ../extracted/shared-board/camera_01_timestamps.csv
   - view_id: camera-02
-    video: ../extracted/shared-board/camera-02.mp4
+    video: ../extracted/shared-board/camera_02.mp4
     calibration_bundle: ../calibration/camera-02/floor/calibration-bundle.yaml
-    timestamp_csv: ../extracted/shared-board/camera-02_timestamps.csv
+    timestamp_csv: ../extracted/shared-board/camera_02_timestamps.csv
   - view_id: camera-03
-    video: ../extracted/shared-board/camera-03.mp4
+    video: ../extracted/shared-board/camera_03.mp4
     calibration_bundle: ../calibration/camera-03/floor/calibration-bundle.yaml
-    timestamp_csv: ../extracted/shared-board/camera-03_timestamps.csv
+    timestamp_csv: ../extracted/shared-board/camera_03_timestamps.csv

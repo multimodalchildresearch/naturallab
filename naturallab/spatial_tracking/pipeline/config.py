@@ -159,25 +159,18 @@ class DeepSORTConfig:
 
 @dataclass(frozen=True)
 class QwenRoleAssignmentConfig:
-    """Post-tracking semantic-role assignment settings."""
+    """Backend defaults for optional caller-configured role assignment."""
 
     backend: str
     model_id: str
     prompt_version: str
     evidence_images_per_track: int
     allow_abstention: bool
-    roles: tuple[str, ...]
-    role_descriptions: tuple[tuple[str, str], ...] = ()
-
-    def role_description_mapping(self) -> dict[str, str]:
-        """Return role descriptions in the backend's mapping form."""
-
-        return dict(self.role_descriptions)
 
 
 @dataclass(frozen=True)
 class SpatialPipelinePreset:
-    """A complete, validated detector/tracker/role configuration."""
+    """Validated detector/tracker and optional role-backend settings."""
 
     name: str
     version: int
@@ -212,10 +205,6 @@ class SpatialPipelinePreset:
             "role_prompt_version": self.role_assignment.prompt_version,
             "role_evidence_images_per_track": (
                 self.role_assignment.evidence_images_per_track
-            ),
-            "roles": list(self.role_assignment.roles),
-            "role_descriptions": (
-                self.role_assignment.role_description_mapping()
             ),
             "role_allow_abstention": (
                 self.role_assignment.allow_abstention
@@ -290,45 +279,6 @@ def _optional_probability(value: Any, path: str) -> Optional[float]:
     if value is None:
         return None
     return _probability(value, path)
-
-
-def _roles(value: Any, path: str) -> tuple[str, ...]:
-    if (
-        isinstance(value, (str, bytes))
-        or not isinstance(value, Sequence)
-        or not value
-    ):
-        raise PipelineConfigError(f"{path} must be a non-empty list")
-    roles = tuple(
-        _text(role, f"{path}[{index}]")
-        for index, role in enumerate(value)
-    )
-    if len(set(roles)) != len(roles):
-        raise PipelineConfigError(f"{path} must not contain duplicate roles")
-    return roles
-
-
-def _role_descriptions(
-    value: Any,
-    roles: Sequence[str],
-    path: str,
-) -> tuple[tuple[str, str], ...]:
-    if value is None:
-        return ()
-    mapping = _mapping(
-        value,
-        path,
-        required=(),
-        optional=roles,
-    )
-    return tuple(
-        (
-            role,
-            _text(mapping[role], f"{path}.{role}"),
-        )
-        for role in roles
-        if role in mapping
-    )
 
 
 def parse_spatial_pipeline_preset(
@@ -419,9 +369,7 @@ def parse_spatial_pipeline_preset(
             "prompt_version",
             "evidence_images_per_track",
             "allow_abstention",
-            "roles",
         ),
-        optional=("role_descriptions",),
     )
 
     jpeg_quality = _positive_integer(
@@ -433,10 +381,6 @@ def parse_spatial_pipeline_preset(
             "spatial.detector.jpeg_quality must be between 1 and 100"
         )
 
-    parsed_roles = _roles(
-        role["roles"],
-        "spatial.role_assignment.roles",
-    )
     preset = SpatialPipelinePreset(
         name=_text(root["name"], "name"),
         version=_positive_integer(root["version"], "version"),
@@ -583,12 +527,6 @@ def parse_spatial_pipeline_preset(
             allow_abstention=_boolean(
                 role["allow_abstention"],
                 "spatial.role_assignment.allow_abstention",
-            ),
-            roles=parsed_roles,
-            role_descriptions=_role_descriptions(
-                role.get("role_descriptions"),
-                parsed_roles,
-                "spatial.role_assignment.role_descriptions",
             ),
         ),
     )
@@ -867,28 +805,6 @@ def validate_spatial_pipeline_preset(
     _boolean(
         role.allow_abstention,
         "spatial.role_assignment.allow_abstention",
-    )
-    roles = _roles(role.roles, "spatial.role_assignment.roles")
-    if not isinstance(role.role_descriptions, tuple):
-        raise PipelineConfigError(
-            "spatial.role_assignment.role_descriptions must be immutable "
-            "(a tuple of role/description pairs)"
-        )
-    try:
-        description_mapping = dict(role.role_descriptions)
-    except (TypeError, ValueError) as error:
-        raise PipelineConfigError(
-            "spatial.role_assignment.role_descriptions must contain "
-            "two-item role/description pairs"
-        ) from error
-    if len(description_mapping) != len(role.role_descriptions):
-        raise PipelineConfigError(
-            "spatial.role_assignment.role_descriptions contains duplicates"
-        )
-    _role_descriptions(
-        description_mapping,
-        roles,
-        "spatial.role_assignment.role_descriptions",
     )
     _validate_supported_quality_path(preset)
 

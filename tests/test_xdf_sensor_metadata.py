@@ -16,6 +16,40 @@ import pytest
 from naturallab.acquisition import lsl_streams, xdf_extract
 
 
+def _channel_description(labels: list[str]) -> list[dict]:
+    return [
+        {
+            "channels": [
+                {
+                    "channel": [
+                        {"label": [label]}
+                        for label in labels
+                    ]
+                }
+            ]
+        }
+    ]
+
+
+def _numeric_stream(
+    stream_type: str,
+    name: str,
+    labels: list[str],
+    samples,
+    timestamps,
+) -> dict:
+    return {
+        "info": {
+            "name": [name],
+            "type": [stream_type],
+            "channel_count": [str(len(labels))],
+            "desc": _channel_description(labels),
+        },
+        "time_series": samples,
+        "time_stamps": timestamps,
+    }
+
+
 def _imu_stream(name: str, marker: float) -> dict:
     samples = np.zeros((2, 13), dtype=np.float64)
     samples[:, 0] = marker
@@ -65,11 +99,15 @@ def _device_metadata_stream(scale: float) -> dict:
 
 
 class _VideoWriter:
-    def __init__(self, *_args, **_kwargs):
+    def __init__(self, path, *_args, **_kwargs):
         self.frames = []
+        Path(path).write_bytes(b"fake-video")
 
     def write(self, frame):
         self.frames.append(frame)
+
+    def isOpened(self):
+        return True
 
     def release(self):
         return None
@@ -93,8 +131,8 @@ def test_multiple_imu_streams_use_distinct_deterministic_files(
     output_dir = tmp_path / "extracted"
     xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
 
-    child_path = output_dir / "imu_neonimu_child.csv"
-    caregiver_path = output_dir / "imu_neonimu_caregiver.csv"
+    child_path = output_dir / "neonimu_child.csv"
+    caregiver_path = output_dir / "neonimu_caregiver.csv"
     assert child_path.is_file()
     assert caregiver_path.is_file()
     assert not (output_dir / "imu.csv").exists()
@@ -109,11 +147,11 @@ def test_multiple_imu_streams_use_distinct_deterministic_files(
     assert "timestamp [ns]" not in child.columns
     assert "datetime" not in child.columns
     summary = capsys.readouterr().out
-    assert "NeonIMU_Child -> imu_neonimu_child.csv" in summary
-    assert "NeonIMU_Caregiver -> imu_neonimu_caregiver.csv" in summary
+    assert "NeonIMU_Child -> neonimu_child.csv" in summary
+    assert "NeonIMU_Caregiver -> neonimu_caregiver.csv" in summary
 
 
-def test_single_imu_stream_retains_unambiguous_legacy_filename(
+def test_single_imu_stream_uses_its_safe_deterministic_stem(
     tmp_path,
     monkeypatch,
 ):
@@ -127,8 +165,8 @@ def test_single_imu_stream_retains_unambiguous_legacy_filename(
     output_dir = tmp_path / "extracted"
     xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
 
-    assert (output_dir / "imu.csv").is_file()
-    assert not (output_dir / "imu_neonimu_child.csv").exists()
+    assert (output_dir / "neonimu_child.csv").is_file()
+    assert not (output_dir / "imu.csv").exists()
 
 
 def test_multi_role_imu_extraction_fails_if_one_role_is_empty(
@@ -150,9 +188,7 @@ def test_multi_role_imu_extraction_fails_if_one_role_is_empty(
     with pytest.raises(RuntimeError, match="no IMU samples"):
         xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
 
-    assert (output_dir / "imu_neonimu_child.csv").is_file()
-    assert not (output_dir / "imu_neonimu_caregiver.csv").exists()
-    assert not list(output_dir.glob("NeonIMU_Caregiver_*"))
+    assert not output_dir.exists()
     assert "All streams extracted" not in capsys.readouterr().out
 
 
@@ -174,10 +210,97 @@ def test_multi_role_imu_extraction_fails_on_timestamp_mismatch(
     with pytest.raises(RuntimeError, match="IMU timestamp/sample mismatch"):
         xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
 
-    assert (output_dir / "imu_neonimu_child.csv").is_file()
-    assert not (output_dir / "imu_neonimu_caregiver.csv").exists()
-    assert not list(output_dir.glob("NeonIMU_Caregiver_*"))
+    assert not output_dir.exists()
     assert "All streams extracted" not in capsys.readouterr().out
+
+
+def test_failed_extraction_preserves_an_existing_empty_target(
+    tmp_path,
+    monkeypatch,
+):
+    child = _imu_stream("NeonIMU_Child", 11.0)
+    caregiver = _imu_stream("NeonIMU_Caregiver", 22.0)
+    caregiver["time_stamps"] = np.array([1.0])
+    monkeypatch.setattr(
+        xdf_extract,
+        "pyxdf",
+        SimpleNamespace(load_xdf=lambda _path: ([child, caregiver], {})),
+    )
+    output_dir = tmp_path / "extracted"
+    output_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="IMU timestamp/sample mismatch"):
+        xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
+
+    assert output_dir.is_dir()
+    assert list(output_dir.iterdir()) == []
+    assert not list(tmp_path.glob(".extracted.staging-*"))
+
+
+def test_stream_names_are_sanitized_without_path_traversal(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    stream = _numeric_stream(
+        "Markers",
+        "../../Outside Results",
+        ["marker"],
+        [[7]],
+        [1.0],
+    )
+    monkeypatch.setattr(
+        xdf_extract,
+        "pyxdf",
+        SimpleNamespace(load_xdf=lambda _path: ([stream], {})),
+    )
+
+    output_dir = tmp_path / "extracted"
+    xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
+
+    assert {path.name for path in output_dir.iterdir()} == {
+        "outside_results.csv"
+    }
+    assert not (tmp_path / "Outside Results.csv").exists()
+    assert "../../Outside Results" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "streams",
+    [
+        [
+            _numeric_stream("Markers", "Room/Camera", ["value"], [[1]], [1.0]),
+            _numeric_stream("Markers", "Room Camera", ["value"], [[2]], [2.0]),
+        ],
+        [
+            _numeric_stream("VideoStream", "Camera", ["frame"], [[1]], [1.0]),
+            _numeric_stream(
+                "Markers",
+                "Camera timestamps",
+                ["value"],
+                [[2]],
+                [2.0],
+            ),
+        ],
+    ],
+)
+def test_ambiguous_stream_output_names_are_rejected_before_writing(
+    tmp_path,
+    monkeypatch,
+    streams,
+):
+    monkeypatch.setattr(
+        xdf_extract,
+        "pyxdf",
+        SimpleNamespace(load_xdf=lambda _path: (streams, {})),
+    )
+    output_dir = tmp_path / "extracted"
+
+    with pytest.raises(RuntimeError, match="ambiguous XDF stream"):
+        xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
+
+    assert not output_dir.exists()
+    assert not list(tmp_path.glob(".extracted.staging-*"))
 
 
 def test_imu_extraction_rejects_malformed_samples_without_fallbacks(tmp_path):
@@ -202,6 +325,11 @@ def test_depth_extraction_uses_recorded_deviceinfo_scale(
         SimpleNamespace(load_xdf=lambda _path: (streams, {})),
     )
     monkeypatch.setattr(cv2, "VideoWriter", _VideoWriter)
+    monkeypatch.setattr(
+        xdf_extract,
+        "_verify_video_file",
+        lambda *_args, **_kwargs: None,
+    )
 
     output_dir = tmp_path / "extracted"
     xdf_extract.extract_streams(
@@ -212,14 +340,14 @@ def test_depth_extraction_uses_recorded_deviceinfo_scale(
     )
 
     distance = np.loadtxt(
-        output_dir / "RealSense_Depth_depth" / "distance_000000.csv",
+        output_dir / "realsense_depth_depth" / "distance_000000.csv",
         delimiter=",",
     )
     assert distance[0, 1] == pytest.approx(0.25)
     assert distance[1, 1] == pytest.approx(1.0)
 
     depth_metadata = json.loads(
-        (output_dir / "RealSense_Depth_depth_metadata.json").read_text(
+        (output_dir / "realsense_depth_depth_metadata.json").read_text(
             encoding="utf-8"
         )
     )
@@ -250,10 +378,7 @@ def test_depth_extraction_fails_without_recorded_scale(
             output_dir,
         )
 
-    assert not (output_dir / "RealSense_Depth_depth").exists()
-    assert not (
-        output_dir / "RealSense_Depth_depth_metadata.json"
-    ).exists()
+    assert not output_dir.exists()
 
 
 def test_depth_extraction_rejects_conflicting_recorded_scales(
@@ -275,6 +400,71 @@ def test_depth_extraction_rejects_conflicting_recorded_scales(
             tmp_path / "recording.xdf",
             tmp_path / "extracted",
         )
+
+
+def test_depth_extraction_does_not_skip_a_corrupt_frame(
+    tmp_path,
+    monkeypatch,
+):
+    stream = _depth_stream(embedded_scale=0.0025)
+    stream["time_series"].append(["not-base64"])
+    stream["time_stamps"] = np.array([10.0, 10.1])
+    monkeypatch.setattr(cv2, "VideoWriter", _VideoWriter)
+
+    with pytest.raises(RuntimeError, match="could not decode depth frame 1"):
+        xdf_extract.extract_depth_stream(
+            stream,
+            tmp_path,
+            save_interval=1,
+            include_csv=True,
+        )
+
+    assert not (tmp_path / "realsense_depth_timestamps.csv").exists()
+    assert not (tmp_path / "realsense_depth_depth_metadata.json").exists()
+    assert not (tmp_path / "realsense_depth_depth").exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_depth_extraction_fails_when_raw_png_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    stream = _depth_stream(embedded_scale=0.0025)
+    monkeypatch.setattr(cv2, "VideoWriter", _VideoWriter)
+    monkeypatch.setattr(cv2, "imwrite", lambda *_args, **_kwargs: False)
+
+    with pytest.raises(RuntimeError, match="could not write raw depth frame 0"):
+        xdf_extract.extract_depth_stream(
+            stream,
+            tmp_path,
+            save_interval=1,
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_depth_extraction_fails_when_metric_csv_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    stream = _depth_stream(embedded_scale=0.0025)
+    monkeypatch.setattr(cv2, "VideoWriter", _VideoWriter)
+    monkeypatch.setattr(cv2, "imwrite", lambda *_args, **_kwargs: True)
+
+    def fail_metric_write(*_args, **_kwargs):
+        raise OSError("fixture disk failure")
+
+    monkeypatch.setattr(np, "savetxt", fail_metric_write)
+
+    with pytest.raises(OSError, match="fixture disk failure"):
+        xdf_extract.extract_depth_stream(
+            stream,
+            tmp_path,
+            save_interval=1,
+            include_csv=True,
+        )
+
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_depth_scale_is_not_borrowed_by_an_unmatched_second_sensor():
@@ -327,6 +517,9 @@ def test_gaze_extraction_preserves_lsl_clock_and_ignores_stale_imu(tmp_path):
             "name": ["NeonGaze_Child"],
             "type": ["Gaze"],
             "channel_count": ["16"],
+            "desc": _channel_description(
+                [f"recorded_gaze_channel_{index}" for index in range(16)]
+            ),
         },
         "time_series": np.zeros((2, 16), dtype=np.float64),
         "time_stamps": np.array([12.0, 12.1]),
@@ -334,11 +527,246 @@ def test_gaze_extraction_preserves_lsl_clock_and_ignores_stale_imu(tmp_path):
 
     xdf_extract.extract_gaze_stream(stream, tmp_path)
 
-    gaze = pd.read_csv(tmp_path / "NeonGaze_Child.csv")
+    gaze = pd.read_csv(tmp_path / "neongaze_child.csv")
     assert gaze["timestamp"].tolist() == [12.0, 12.1]
     assert set(gaze["timestamp_domain"]) == {"lsl"}
     assert "datetime" not in gaze.columns
     assert "lsl_relative_timestamp" not in gaze.columns
+
+
+def test_gaze_extraction_preserves_recorded_indices_and_requires_labels(tmp_path):
+    labels = [
+        "frame_index",
+        "gaze_x",
+        "gaze_y",
+        "pupil_diameter_left",
+        "pupil_diameter_right",
+    ]
+    stream = _numeric_stream(
+        "Gaze",
+        "NeonGaze_Child",
+        labels,
+        [[42, 10, 20, 3, 4], [44, 11, 21, 3.1, 4.1]],
+        [100.0, 100.1],
+    )
+
+    xdf_extract.extract_gaze_stream(stream, tmp_path)
+
+    gaze = pd.read_csv(tmp_path / "neongaze_child.csv")
+    assert gaze["frame_index"].tolist() == [42.0, 44.0]
+    assert gaze["timestamp"].tolist() == [100.0, 100.1]
+    assert "original_frame_index" not in gaze.columns
+    assert "datetime" not in gaze.columns
+
+    stream["info"].pop("desc")
+    with pytest.raises(RuntimeError, match="channel-label group"):
+        xdf_extract.extract_gaze_stream(stream, tmp_path / "missing-labels")
+
+
+@pytest.mark.parametrize(
+    ("samples", "timestamps", "message"),
+    [
+        ([], [], "no samples"),
+        ([[1.0, 2.0], [3.0]], [1.0, 2.0], "rectangular numeric"),
+        ([[1.0, 2.0]], [1.0, 2.0], "timestamp/sample mismatch"),
+        ([[1.0, float("nan")]], [1.0], "non-finite samples"),
+        ([[1.0, 2.0], [3.0, 4.0]], [1.0, 1.0], "strictly increasing"),
+    ],
+)
+def test_declared_gaze_rejects_incomplete_or_ambiguous_data(
+    tmp_path,
+    samples,
+    timestamps,
+    message,
+):
+    stream = _numeric_stream(
+        "Gaze",
+        "Gaze",
+        ["x", "y"],
+        samples,
+        timestamps,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        xdf_extract.extract_gaze_stream(stream, tmp_path)
+
+    assert not (tmp_path / "gaze.csv").exists()
+    assert not list(tmp_path.glob("*.json"))
+    assert not list(tmp_path.glob("*.npy"))
+
+
+def test_eye_event_extraction_preserves_sensor_time_and_optional_nan(tmp_path):
+    fixation_labels = [
+        "fixation_id",
+        "start_timestamp_ns",
+        "end_timestamp_ns",
+        "duration_ms",
+        "fixation_x_px",
+        "fixation_y_px",
+        "azimuth_deg",
+        "elevation_deg",
+    ]
+    fixation = _numeric_stream(
+        "Fixations",
+        "NeonFixations_Child",
+        fixation_labels,
+        [[7, 1_000_000_000, 1_100_000_000, 100, np.nan, 20, np.nan, 2]],
+        [50.25],
+    )
+    saccade_labels = [
+        "saccade_id",
+        "start_timestamp_ns",
+        "end_timestamp_ns",
+        "amplitude_deg",
+        "amplitude_px",
+        "mean_velocity_px_s",
+        "peak_velocity_px_s",
+        "duration_ms",
+    ]
+    saccade = _numeric_stream(
+        "Saccades",
+        "NeonSaccades_Child",
+        saccade_labels,
+        [[9, 2_000_000_000, 2_050_000_000, np.nan, 30, np.nan, 70, 50]],
+        [51.25],
+    )
+
+    xdf_extract.extract_fixations_stream(fixation, tmp_path)
+    xdf_extract.extract_saccades_stream(saccade, tmp_path)
+
+    fixations = pd.read_csv(tmp_path / "neonfixations_child.csv")
+    saccades = pd.read_csv(tmp_path / "neonsaccades_child.csv")
+    assert fixations["start_timestamp_ns"].iloc[0] == 1_000_000_000
+    assert saccades["start_timestamp_ns"].iloc[0] == 2_000_000_000
+    assert np.isnan(fixations["fixation_x_px"].iloc[0])
+    assert np.isnan(saccades["amplitude_deg"].iloc[0])
+    assert fixations["timestamp"].iloc[0] == 50.25
+    assert saccades["timestamp"].iloc[0] == 51.25
+    assert set(fixations["timestamp_domain"]) == {"lsl"}
+    assert set(saccades["timestamp_domain"]) == {"lsl"}
+    for forbidden in ("section_id", "recording_id", "detected_datetime"):
+        assert forbidden not in fixations.columns
+        assert forbidden not in saccades.columns
+
+
+def test_multiple_eye_event_streams_receive_distinct_safe_files(
+    tmp_path,
+    monkeypatch,
+):
+    fixation_labels = [
+        "fixation_id",
+        "start_timestamp_ns",
+        "end_timestamp_ns",
+        "duration_ms",
+    ]
+    saccade_labels = [
+        "saccade_id",
+        "start_timestamp_ns",
+        "end_timestamp_ns",
+        "duration_ms",
+    ]
+    streams = [
+        _numeric_stream(
+            "Fixations",
+            "NeonFixations/Child",
+            fixation_labels,
+            [[1, 10, 20, 10]],
+            [1.0],
+        ),
+        _numeric_stream(
+            "Fixations",
+            "NeonFixations Caregiver",
+            fixation_labels,
+            [[2, 30, 40, 10]],
+            [2.0],
+        ),
+        _numeric_stream(
+            "Saccades",
+            "NeonSaccades/Child",
+            saccade_labels,
+            [[3, 50, 60, 10]],
+            [3.0],
+        ),
+        _numeric_stream(
+            "Saccades",
+            "NeonSaccades Caregiver",
+            saccade_labels,
+            [[4, 70, 80, 10]],
+            [4.0],
+        ),
+    ]
+    monkeypatch.setattr(
+        xdf_extract,
+        "pyxdf",
+        SimpleNamespace(load_xdf=lambda _path: (streams, {})),
+    )
+
+    output_dir = tmp_path / "extracted"
+    xdf_extract.extract_streams(tmp_path / "recording.xdf", output_dir)
+
+    assert {path.name for path in output_dir.iterdir()} == {
+        "neonfixations_child.csv",
+        "neonfixations_caregiver.csv",
+        "neonsaccades_child.csv",
+        "neonsaccades_caregiver.csv",
+    }
+    assert pd.read_csv(output_dir / "neonfixations_child.csv")[
+        "fixation_id"
+    ].tolist() == [1.0]
+    assert pd.read_csv(output_dir / "neonfixations_caregiver.csv")[
+        "fixation_id"
+    ].tolist() == [2.0]
+
+
+def test_eye_event_extraction_rejects_missing_required_fields_without_fallback(
+    tmp_path,
+):
+    stream = _numeric_stream(
+        "Fixations",
+        "NeonFixations_Child",
+        [
+            "fixation_id",
+            "start_timestamp_ns",
+            "end_timestamp_ns",
+            "duration_ms",
+            "fixation_x_px",
+            "fixation_y_px",
+            "azimuth_deg",
+            "elevation_deg",
+        ],
+        [[1, 10, 20, float("nan"), 3, 4, 5, 6]],
+        [1.0],
+    )
+
+    with pytest.raises(RuntimeError, match="duration_ms.*non-finite"):
+        xdf_extract.extract_fixations_stream(stream, tmp_path)
+
+    assert not (tmp_path / "neonfixations_child.csv").exists()
+    assert not list(tmp_path.glob("*.json"))
+    assert not list(tmp_path.glob("*.npy"))
+
+
+def test_generic_extraction_requires_explicit_labels_and_strict_counts(tmp_path):
+    stream = _numeric_stream(
+        "Markers",
+        "TaskMarkers",
+        ["code", "trial"],
+        [[1, 4], [2, 4]],
+        [5.0, 5.5],
+    )
+    output = xdf_extract.extract_generic_stream(stream, tmp_path)
+    exported = pd.read_csv(output)
+    assert exported.columns.tolist() == [
+        "code",
+        "trial",
+        "timestamp",
+        "timestamp_domain",
+    ]
+    assert set(exported["timestamp_domain"]) == {"lsl"}
+
+    stream["info"].pop("desc")
+    with pytest.raises(RuntimeError, match="channel-label group"):
+        xdf_extract.extract_generic_stream(stream, tmp_path / "no-labels")
 
 
 def test_audio_extraction_preserves_sample_alignment_and_lsl_clock(
@@ -368,7 +796,7 @@ def test_audio_extraction_preserves_sample_alignment_and_lsl_clock(
     output = xdf_extract.extract_audio_stream(stream, tmp_path)
 
     assert Path(output).read_bytes() == b"fake-wave"
-    timestamps = pd.read_csv(tmp_path / "NeonAudio_Child_timestamps.csv")
+    timestamps = pd.read_csv(tmp_path / "neonaudio_child_timestamps.csv")
     assert timestamps["sample_index"].tolist() == [0, 1, 2]
     assert timestamps["timestamp"].tolist() == [20.0, 20.000125, 20.00025]
     assert set(timestamps["timestamp_domain"]) == {"lsl"}

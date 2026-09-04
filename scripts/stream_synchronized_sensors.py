@@ -3,23 +3,23 @@
 Stream Multiple Sensors via LSL
 ================================
 
-Create Lab Streaming Layer (LSL) streams from multiple sensor sources. Samples
-use host-arrival timestamps in LSL's local-clock domain and can be recorded
-using LabRecorder. These timestamps are not camera exposure timestamps; measure
-capture offset and drift before making cross-device timing claims.
+Create Lab Streaming Layer (LSL) streams from multiple sensor sources. Every
+requested source must publish a first sample before startup succeeds. If a
+source fails or stops afterward, the process stops with a nonzero status rather
+than silently recording a partial sensor set.
+
+Samples use host-arrival timestamps in LSL's local-clock domain and can be
+recorded using LabRecorder. These timestamps are not camera exposure
+timestamps; measure capture offset and drift before making cross-device timing
+claims.
 
 Supported Sensors:
-- RTSP network cameras (IP cameras, webcams)
-- Pupil Labs Neon eye trackers
-- Intel RealSense depth cameras
-- Custom sensors (via extension)
+- RTSP network cameras
+- Pupil Labs Neon matched scene-video and gaze streams
+- One Intel RealSense colour/raw-depth stream with recorded hardware scale
 
-Use Cases:
-- Multi-camera behavioral recording
-- Eye tracking studies
-- Motion capture with depth sensing
-- Multi-modal data collection for separately validated time alignment
-- Remote monitoring and recording
+This source-checkout helper does not stream Neon audio, IMU, or eye events. Use
+the installed ``naturallab record`` workflow when those streams are required.
 
 Example Usage:
     # Stream from RTSP cameras
@@ -39,17 +39,119 @@ Example Usage:
 """
 
 import argparse
+import base64
+import json
 import math
-import sys
-import time
-import threading
 import signal
+import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Global flag for clean shutdown
 running = True
+
+
+class WorkerStatus:
+    """Thread-safe startup and failure state for one requested source."""
+
+    def __init__(self, name):
+        self.name = name
+        self.started = threading.Event()
+        self.finished = threading.Event()
+        self._failure = None
+        self._lock = threading.Lock()
+
+    @property
+    def failure(self):
+        with self._lock:
+            return self._failure
+
+    def mark_started(self):
+        self.started.set()
+
+    def mark_failed(self, message):
+        with self._lock:
+            if self._failure is None:
+                self._failure = str(message)
+
+
+def _mark_started(worker_status):
+    if worker_status is not None:
+        worker_status.mark_started()
+
+
+def _optional_float(value):
+    """Preserve a real zero while representing an unavailable value as NaN."""
+
+    return float("nan") if value is None else float(value)
+
+
+def _run_worker(worker_status, target, arguments):
+    """Run one source and convert every unexpected stop into a failure."""
+
+    try:
+        target(*arguments, worker_status=worker_status)
+    except Exception as error:
+        worker_status.mark_failed(f"{type(error).__name__}: {error}")
+    finally:
+        if not worker_status.started.is_set() and worker_status.failure is None:
+            worker_status.mark_failed("stopped before publishing its first sample")
+        elif running and worker_status.failure is None:
+            worker_status.mark_failed("stopped unexpectedly")
+        worker_status.finished.set()
+
+
+def _launch_worker(name, target, *arguments):
+    status = WorkerStatus(name)
+    thread = threading.Thread(
+        target=_run_worker,
+        args=(status, target, arguments),
+        daemon=True,
+        name=f"naturallab-{name}",
+    )
+    thread.start()
+    return status, thread
+
+
+def _worker_failures(workers):
+    return [status for status, _thread in workers if status.failure is not None]
+
+
+def _stop_workers(workers):
+    global running
+
+    running = False
+    deadline = time.monotonic() + 2.0
+    for _status, thread in workers:
+        remaining = max(0.0, deadline - time.monotonic())
+        thread.join(timeout=remaining)
+
+
+def _wait_for_worker_startup(workers, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while running:
+        failures = _worker_failures(workers)
+        if failures:
+            return failures
+        if all(status.started.is_set() for status, _thread in workers):
+            return []
+        if time.monotonic() >= deadline:
+            for status, _thread in workers:
+                if not status.started.is_set():
+                    status.mark_failed(
+                        f"did not publish a first sample within {timeout_seconds:g} seconds"
+                    )
+            return _worker_failures(workers)
+        time.sleep(0.05)
+    return []
+
+
+def _print_worker_failures(failures):
+    for status in failures:
+        print(f"ERROR: requested source {status.name!r}: {status.failure}", file=sys.stderr)
 
 
 def parse_comma_separated(parser, value, option):
@@ -68,10 +170,9 @@ def signal_handler(signum, frame):
     running = False
 
 
-def stream_rtsp_camera(url, stream_name, quality=75):
+def stream_rtsp_camera(url, stream_name, quality=75, worker_status=None):
     """Stream RTSP camera to LSL."""
     import cv2
-    import base64
     import pylsl
     
     print(f"[{stream_name}] Starting RTSP stream (URL hidden)")
@@ -79,8 +180,7 @@ def stream_rtsp_camera(url, stream_name, quality=75):
     # Open camera
     cap = cv2.VideoCapture(url)
     if not cap.isOpened():
-        print(f"[{stream_name}] ERROR: Could not open camera")
-        return
+        raise RuntimeError("could not open the RTSP camera")
     
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -108,49 +208,65 @@ def stream_rtsp_camera(url, stream_name, quality=75):
     frame_count = 0
     start_time = time.monotonic()
     
-    while running:
-        ret, frame = cap.read()
-        if not ret:
-            print(f"[{stream_name}] Reconnecting...")
-            cap.release()
-            time.sleep(2)
-            cap = cv2.VideoCapture(url)
-            continue
-        
-        # Encode frame
-        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        b64_frame = base64.b64encode(jpeg.tobytes()).decode("utf-8")
-        
-        # Host-arrival/post-decode time in LSL's domain, not exposure time.
-        outlet.push_sample([b64_frame], pylsl.local_clock())
-        
-        frame_count += 1
-        if frame_count % 100 == 0:
-            elapsed = time.monotonic() - start_time
-            fps = frame_count / elapsed
-            print(f"[{stream_name}] {frame_count} frames ({fps:.1f} FPS)")
-    
-    cap.release()
+    try:
+        while running:
+            ret, frame = cap.read()
+            if not ret:
+                print(f"[{stream_name}] Reconnecting...")
+                cap.release()
+                time.sleep(2)
+                if not running:
+                    break
+                cap = cv2.VideoCapture(url)
+                if not cap.isOpened():
+                    raise RuntimeError(
+                        "the RTSP source stopped and reconnection failed"
+                    )
+                continue
+
+            # Encode frame
+            encoded, jpeg = cv2.imencode(
+                ".jpg",
+                frame,
+                [cv2.IMWRITE_JPEG_QUALITY, quality],
+            )
+            if not encoded:
+                raise RuntimeError("could not encode an RTSP frame as JPEG")
+            b64_frame = base64.b64encode(jpeg.tobytes()).decode("utf-8")
+
+            # Host-arrival/post-decode time in LSL's domain, not exposure time.
+            outlet.push_sample([b64_frame], pylsl.local_clock())
+            if frame_count == 0:
+                _mark_started(worker_status)
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                elapsed = time.monotonic() - start_time
+                fps = frame_count / elapsed
+                print(f"[{stream_name}] {frame_count} frames ({fps:.1f} FPS)")
+    finally:
+        cap.release()
+
     print(f"[{stream_name}] Stopped")
 
 
-def stream_neon_device(ip_address, device_name):
+def stream_neon_device(ip_address, device_name, worker_status=None):
     """Stream Pupil Labs Neon to LSL."""
     import pylsl
     
     try:
         from pupil_labs.realtime_api.simple import Device
-    except ImportError:
-        print(f"[{device_name}] ERROR: pupil-labs-realtime-api not installed")
-        return
+    except ImportError as error:
+        raise RuntimeError(
+            "pupil-labs-realtime-api is not installed"
+        ) from error
     
     print(f"[{device_name}] Connecting to Neon at {ip_address}...")
     
     try:
         device = Device(address=ip_address, port="8080")
     except Exception as e:
-        print(f"[{device_name}] ERROR: Could not connect: {e}")
-        return
+        raise RuntimeError(f"could not connect to the Neon device: {e}") from e
     
     # Create gaze stream
     gaze_info = pylsl.StreamInfo(
@@ -182,8 +298,8 @@ def stream_neon_device(ip_address, device_name):
     frame_count = 0
     start_time = time.monotonic()
     
-    while running:
-        try:
+    try:
+        while running:
             scene, gaze = device.receive_matched_scene_video_frame_and_gaze()
             # Host-arrival time in LSL's domain, not sensor capture time.
             lsl_timestamp = pylsl.local_clock()
@@ -193,40 +309,42 @@ def stream_neon_device(ip_address, device_name):
                 float(frame_count),
                 float(gaze.x),
                 float(gaze.y),
-                float(gaze.pupil_diameter_left or 0),
-                float(gaze.pupil_diameter_right or 0)
+                _optional_float(gaze.pupil_diameter_left),
+                _optional_float(gaze.pupil_diameter_right),
             ]
             gaze_outlet.push_sample(gaze_data, lsl_timestamp)
             
             # Push video frame
-            _, jpeg = cv2.imencode(".jpg", scene.bgr_pixels, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            encoded, jpeg = cv2.imencode(
+                ".jpg",
+                scene.bgr_pixels,
+                [cv2.IMWRITE_JPEG_QUALITY, 75],
+            )
+            if not encoded:
+                raise RuntimeError("could not encode a Neon scene frame as JPEG")
             b64_frame = base64.b64encode(jpeg.tobytes()).decode("utf-8")
             video_outlet.push_sample([b64_frame], lsl_timestamp)
+            if frame_count == 0:
+                _mark_started(worker_status)
             
             frame_count += 1
             if frame_count % 100 == 0:
                 elapsed = time.monotonic() - start_time
                 fps = frame_count / elapsed
                 print(f"[{device_name}] {frame_count} frames ({fps:.1f} FPS)")
-                
-        except Exception as e:
-            print(f"[{device_name}] Error: {e}")
-            time.sleep(0.1)
-    
-    device.close()
+    finally:
+        device.close()
     print(f"[{device_name}] Stopped")
 
 
-def stream_realsense(device_name="RealSense"):
+def stream_realsense(device_name="RealSense", worker_status=None):
     """Stream Intel RealSense to LSL."""
     import pylsl
-    import base64
     
     try:
         import pyrealsense2 as rs
-    except ImportError:
-        print(f"[{device_name}] ERROR: pyrealsense2 not installed")
-        return
+    except ImportError as error:
+        raise RuntimeError("pyrealsense2 is not installed") from error
     
     print(f"[{device_name}] Initializing...")
     
@@ -235,11 +353,21 @@ def stream_realsense(device_name="RealSense"):
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
     
-    try:
-        pipeline.start(config)
-    except Exception as e:
-        print(f"[{device_name}] ERROR: Could not start: {e}")
-        return
+    profile = pipeline.start(config)
+    device = profile.get_device()
+    depth_scale = float(device.first_depth_sensor().get_depth_scale())
+    if not math.isfinite(depth_scale) or depth_scale <= 0:
+        pipeline.stop()
+        raise RuntimeError(
+            "RealSense returned an invalid hardware depth scale: "
+            f"{depth_scale!r}"
+        )
+    device_name_value = device.get_info(rs.camera_info.name)
+    serial_number = device.get_info(rs.camera_info.serial_number)
+    print(
+        f"[{device_name}] Connected to {device_name_value}; "
+        f"serial {serial_number}; depth scale {depth_scale} metres per raw unit"
+    )
     
     # Create color stream
     color_info = pylsl.StreamInfo(
@@ -261,7 +389,46 @@ def stream_realsense(device_name="RealSense"):
         channel_format="string",
         source_id="realsense_depth"
     )
+    depth_description = depth_info.desc()
+    depth_description.append_child_value("content", "raw_depth")
+    depth_description.append_child_value(
+        "depth_format",
+        "uint16_device_units",
+    )
+    depth_description.append_child_value(
+        "depth_scale_m_per_unit",
+        repr(depth_scale),
+    )
+    depth_description.append_child_value("metric_unit", "metre")
     depth_outlet = pylsl.StreamOutlet(depth_info)
+
+    metadata_info = pylsl.StreamInfo(
+        name=f"{device_name}_Metadata",
+        type="DeviceInfo",
+        channel_count=1,
+        nominal_srate=0,
+        channel_format="string",
+        source_id="realsense_metadata",
+    )
+    metadata_outlet = pylsl.StreamOutlet(metadata_info)
+    metadata_timestamp = pylsl.local_clock()
+    metadata_outlet.push_sample(
+        [
+            json.dumps(
+                {
+                    "name": device_name_value,
+                    "serial": serial_number,
+                    "depth_scale": depth_scale,
+                    "depth_scale_m_per_unit": depth_scale,
+                    "raw_depth_unit": "device_depth_unit",
+                    "metric_unit": "metre",
+                    "timestamp": metadata_timestamp,
+                    "timestamp_clock": "pylsl.local_clock",
+                }
+            )
+        ],
+        metadata_timestamp,
+    )
     
     print(f"[{device_name}] Streaming...")
     
@@ -271,67 +438,109 @@ def stream_realsense(device_name="RealSense"):
     frame_count = 0
     start_time = time.monotonic()
     
-    while running:
-        frames = pipeline.wait_for_frames()
-        color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
-        
-        if not color_frame or not depth_frame:
-            continue
-        
-        # Host-arrival time in LSL's domain, not sensor capture time.
-        lsl_timestamp = pylsl.local_clock()
-        
-        # Color frame
-        color_image = np.asanyarray(color_frame.get_data())
-        _, jpeg = cv2.imencode(".jpg", color_image, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        color_outlet.push_sample(
-            [base64.b64encode(jpeg.tobytes()).decode()],
-            lsl_timestamp,
-        )
-        
-        # Depth frame (PNG to preserve 16-bit)
-        depth_image = np.asanyarray(depth_frame.get_data())
-        _, png = cv2.imencode(".png", depth_image)
-        depth_outlet.push_sample(
-            [base64.b64encode(png.tobytes()).decode()],
-            lsl_timestamp,
-        )
-        
-        frame_count += 1
-        if frame_count % 100 == 0:
-            elapsed = time.monotonic() - start_time
-            fps = frame_count / elapsed
-            print(f"[{device_name}] {frame_count} frames ({fps:.1f} FPS)")
-    
-    pipeline.stop()
+    try:
+        while running:
+            frames = pipeline.wait_for_frames()
+            color_frame = frames.get_color_frame()
+            depth_frame = frames.get_depth_frame()
+
+            if not color_frame or not depth_frame:
+                continue
+
+            # Host-arrival time in LSL's domain, not sensor capture time.
+            lsl_timestamp = pylsl.local_clock()
+
+            # Color frame
+            color_image = np.asanyarray(color_frame.get_data())
+            encoded_color, jpeg = cv2.imencode(
+                ".jpg",
+                color_image,
+                [cv2.IMWRITE_JPEG_QUALITY, 80],
+            )
+            if not encoded_color:
+                raise RuntimeError("could not encode a RealSense colour frame")
+            color_outlet.push_sample(
+                [base64.b64encode(jpeg.tobytes()).decode()],
+                lsl_timestamp,
+            )
+
+            # Depth frame (PNG to preserve the raw 16-bit device values)
+            depth_image = np.asanyarray(depth_frame.get_data())
+            encoded_depth, png = cv2.imencode(".png", depth_image)
+            if not encoded_depth:
+                raise RuntimeError("could not encode a RealSense depth frame")
+            depth_outlet.push_sample(
+                [base64.b64encode(png.tobytes()).decode()],
+                lsl_timestamp,
+            )
+            if frame_count == 0:
+                _mark_started(worker_status)
+
+            frame_count += 1
+            if frame_count % 100 == 0:
+                elapsed = time.monotonic() - start_time
+                fps = frame_count / elapsed
+                print(f"[{device_name}] {frame_count} frames ({fps:.1f} FPS)")
+    finally:
+        pipeline.stop()
     print(f"[{device_name}] Stopped")
 
 
 def main():
+    global running
+
+    running = True
     parser = argparse.ArgumentParser(
         description="Stream sensor data with host-side timestamps via LSL",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
     
     # Camera options
-    parser.add_argument("--cameras", type=str,
-                       help="Comma-separated RTSP camera URLs")
-    parser.add_argument("--camera-names", type=str,
-                       help="Comma-separated camera names (must match --cameras)")
-    parser.add_argument("--camera-quality", type=int, default=75,
-                       help="JPEG quality for camera streams (default: 75)")
+    parser.add_argument(
+        "--cameras",
+        type=str,
+        help="Comma-separated RTSP camera URLs",
+    )
+    parser.add_argument(
+        "--camera-names",
+        type=str,
+        help="Comma-separated camera names (must match --cameras)",
+    )
+    parser.add_argument(
+        "--camera-quality",
+        type=int,
+        default=75,
+        help="JPEG quality for camera streams (default: 75)",
+    )
     
     # Neon options
-    parser.add_argument("--neon-ips", type=str,
-                       help="Comma-separated Neon device IPs")
-    parser.add_argument("--neon-names", type=str,
-                       help="Comma-separated Neon device names")
+    parser.add_argument(
+        "--neon-ips",
+        type=str,
+        help="Comma-separated Neon device IPs",
+    )
+    parser.add_argument(
+        "--neon-names",
+        type=str,
+        help="Comma-separated Neon device names",
+    )
     
     # RealSense options
-    parser.add_argument("--realsense", action="store_true",
-                       help="Enable RealSense depth camera")
+    parser.add_argument(
+        "--realsense",
+        action="store_true",
+        help="Enable one RealSense colour/raw-depth source",
+    )
+    parser.add_argument(
+        "--startup-timeout-seconds",
+        type=float,
+        default=30.0,
+        help=(
+            "Maximum wait for every requested source to publish its first "
+            "sample (default: 30)"
+        ),
+    )
     
     args = parser.parse_args()
 
@@ -345,6 +554,8 @@ def main():
         parser.error("--camera-names requires --cameras")
     if camera_names and len(camera_names) != len(camera_urls):
         parser.error("--camera-names must contain one name per camera URL")
+    if not 1 <= args.camera_quality <= 100:
+        parser.error("--camera-quality must be between 1 and 100")
 
     neon_ips = parse_comma_separated(parser, args.neon_ips, "--neon-ips")
     neon_names = parse_comma_separated(
@@ -356,12 +567,17 @@ def main():
         parser.error("--neon-names requires --neon-ips")
     if neon_names and len(neon_names) != len(neon_ips):
         parser.error("--neon-names must contain one name per Neon IP")
+    if (
+        not math.isfinite(args.startup_timeout_seconds)
+        or args.startup_timeout_seconds <= 0
+    ):
+        parser.error("--startup-timeout-seconds must be a positive number")
     
     # Setup signal handler
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    threads = []
+    workers = []
     
     print("=" * 60)
     print("NaturalLab - Multi-Sensor LSL Streaming")
@@ -373,56 +589,93 @@ def main():
         names = [f"Camera{i+1}" for i in range(len(camera_urls))]
         if camera_names:
             names = camera_names
+        if len(set(names)) != len(names):
+            parser.error("camera names must be unique")
         
         for url, name in zip(camera_urls, names):
-            t = threading.Thread(target=stream_rtsp_camera, 
-                               args=(url, name, args.camera_quality))
-            t.daemon = True
-            t.start()
-            threads.append(t)
+            workers.append(
+                _launch_worker(
+                    f"RTSP camera {name}",
+                    stream_rtsp_camera,
+                    url,
+                    name,
+                    args.camera_quality,
+                )
+            )
     
     # Start Neon streams
     if neon_ips:
         names = [f"Neon{i+1}" for i in range(len(neon_ips))]
         if neon_names:
             names = neon_names
+        if len(set(names)) != len(names):
+            parser.error("Neon names must be unique")
         
         for ip, name in zip(neon_ips, names):
-            t = threading.Thread(target=stream_neon_device, args=(ip, name))
-            t.daemon = True
-            t.start()
-            threads.append(t)
+            workers.append(
+                _launch_worker(
+                    f"Neon {name}",
+                    stream_neon_device,
+                    ip,
+                    name,
+                )
+            )
     
     # Start RealSense stream
     if args.realsense:
-        t = threading.Thread(target=stream_realsense)
-        t.daemon = True
-        t.start()
-        threads.append(t)
+        workers.append(
+            _launch_worker(
+                "RealSense",
+                stream_realsense,
+                "RealSense",
+            )
+        )
     
-    if not threads:
-        print("No sensors configured. Use --help for options.")
+    if not workers:
+        print("No sensors configured. Use --help for options.", file=sys.stderr)
         return 1
-    
+
+    failures = _wait_for_worker_startup(
+        workers,
+        args.startup_timeout_seconds,
+    )
+    if failures:
+        _print_worker_failures(failures)
+        _stop_workers(workers)
+        print("Acquisition did not start; no partial sensor set was accepted.")
+        return 1
+    if not running:
+        _stop_workers(workers)
+        print("Acquisition stopped during startup.")
+        return 0
+
     print()
     print("=" * 60)
-    print("Streams active! Use LabRecorder to record to XDF.")
+    print("Every requested stream published data. Open LabRecorder to record XDF.")
     print("Press Ctrl+C to stop.")
     print("=" * 60)
-    
-    # Wait for threads
+
+    exit_code = 0
     try:
         while running:
-            time.sleep(1)
+            failures = _worker_failures(workers)
+            if failures:
+                _print_worker_failures(failures)
+                print(
+                    "A requested source stopped; stopping the complete "
+                    "acquisition.",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+                break
+            time.sleep(0.2)
     except KeyboardInterrupt:
-        pass
-    
+        running = False
+
     print("\nWaiting for streams to close...")
-    for t in threads:
-        t.join(timeout=2)
-    
+    _stop_workers(workers)
     print("All streams stopped.")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

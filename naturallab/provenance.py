@@ -27,11 +27,20 @@ _SECRET_KEY = re.compile(
     r"(?:password|passwd|passphrase|token|api[_-]?key|secret|credential)",
     re.IGNORECASE,
 )
+_LOCAL_PATH_KEY = re.compile(
+    r"(?:^|_)(?:path|file|directory|dir|video|manifest|bundle|intrinsics|floor)"
+    r"(?:$|_)|^(?:input|output)$",
+    re.IGNORECASE,
+)
 
 
 def _safe_value(value: Any, *, key: str = "") -> Any:
     if key and _SECRET_KEY.search(key):
         return "<redacted>"
+    if isinstance(value, Path) or (
+        key and _LOCAL_PATH_KEY.search(key) and isinstance(value, str)
+    ):
+        return "<redacted-local-path>"
     if isinstance(value, Mapping):
         return {
             str(item_key): _safe_value(item_value, key=str(item_key))
@@ -39,8 +48,8 @@ def _safe_value(value: Any, *, key: str = "") -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [_safe_value(item) for item in value]
-    if isinstance(value, (Path, Enum)):
-        return str(value.value if isinstance(value, Enum) else value)
+    if isinstance(value, Enum):
+        return str(value.value)
     if isinstance(value, float) and not math.isfinite(value):
         return repr(value)
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -74,10 +83,6 @@ def git_provenance(*, cwd: Path | str | None = None) -> Mapping[str, Any]:
 
     repository = Path(root)
     revision = _git_output(["rev-parse", "HEAD"], cwd=repository)
-    branch = _git_output(
-        ["symbolic-ref", "--short", "-q", "HEAD"],
-        cwd=repository,
-    )
     status = _git_output(
         ["status", "--porcelain", "--untracked-files=normal"],
         cwd=repository,
@@ -85,7 +90,6 @@ def git_provenance(*, cwd: Path | str | None = None) -> Mapping[str, Any]:
     return {
         "available": revision is not None,
         "revision": revision,
-        "branch": branch,
         "dirty": None if status is None else bool(status),
     }
 

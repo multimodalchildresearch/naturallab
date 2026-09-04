@@ -108,8 +108,12 @@ python scripts/detect_custom_objects.py create-prototypes \
 ```
 
 The command prints the category folders it found. Check that every expected
-label appears. The first run may download the required pretrained model files;
-an offline lab should download and preserve them before data collection.
+label appears. Every discovered reference image must decode and produce an
+embedding; one failure rejects the complete build instead of averaging only the
+survivors. The HDF5 file is replaced atomically only after the whole build
+succeeds, so a failed rebuild leaves the prior file unchanged. The first run
+may download the required pretrained model files; an offline lab should
+download and preserve them before data collection.
 
 Keep the resulting `private-study-data/prototypes.h5` with the reference
 photographs and study configuration. Rebuilding it after changing photographs
@@ -144,9 +148,11 @@ through the marked frames. The result folder also contains:
   for each category.
 
 For a successfully processed input, an empty table means that no candidate
-passed the chosen thresholds. The command rejects an empty image folder or a
-video with no decodable frames. Match scores help compare settings for this
-exact setup; they are not calibrated probabilities.
+passed the chosen thresholds. The command rejects an empty image folder and a
+video that lacks a trustworthy frame count or decodes fewer requested frames
+than its container reports. A failed run publishes no partial result folder.
+Match scores help compare settings for this exact setup; they are not
+calibrated probabilities.
 
 For a folder of still images, use the folder as `--input`. With
 `--save-frames`, NaturalLab writes one annotated copy per input image.
@@ -220,6 +226,8 @@ steps:
    the current official
    [Ultralytics training guide](https://docs.ultralytics.com/modes/train/) and
    [detection-dataset format](https://docs.ultralytics.com/datasets/detect/).
+   Review NaturalLab's [third-party notices](../THIRD_PARTY_NOTICES.md) before
+   selecting that separately licensed route.
 5. Freeze the chosen weights and settings, then evaluate once on the untouched
    test sessions. Report misses, wrong labels, and false detections for each
    camera condition that matters to the study.

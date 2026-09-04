@@ -35,7 +35,10 @@ Example Usage:
 
 import argparse
 import json
+import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -113,12 +116,75 @@ def classify_detection_input(input_path):
 def require_empty_output_directory(output_path):
     """Refuse to mix a new run with files from an earlier configuration."""
     output_path = Path(output_path)
+    if output_path.is_symlink():
+        raise ValueError(f"refusing symlink output directory: {output_path}")
     if output_path.exists() and not output_path.is_dir():
         raise ValueError(f"output path is not a directory: {output_path}")
     if output_path.exists() and any(output_path.iterdir()):
         raise ValueError(
             f"output directory is not empty: {output_path}; choose a new run name"
         )
+
+
+def create_output_staging_directory(output_path):
+    """Create a same-filesystem staging directory for one detection run."""
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    return Path(
+        tempfile.mkdtemp(
+            prefix=f".{output_path.name or 'output'}.staging-",
+            dir=output_path.parent,
+        )
+    )
+
+
+def publish_output_directory(staging_path, output_path):
+    """Atomically publish a complete run into its preflighted destination."""
+
+    staging_path = Path(staging_path)
+    output_path = Path(output_path)
+    if output_path.exists():
+        if output_path.is_symlink() or not output_path.is_dir():
+            raise ValueError(
+                f"output destination changed during the run: {output_path}"
+            )
+        if any(output_path.iterdir()):
+            raise ValueError(
+                f"output destination became non-empty: {output_path}"
+            )
+        output_path.rmdir()
+    os.replace(staging_path, output_path)
+
+
+def write_prototypes_atomically(output_path, embeddings, model_name, h5py):
+    """Replace one prototype file only after a complete HDF5 write."""
+
+    output_path = Path(output_path)
+    if output_path.is_symlink():
+        raise ValueError(f"refusing symlink prototype output: {output_path}")
+    if output_path.exists() and not output_path.is_file():
+        raise ValueError(f"prototype output is not a file: {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with h5py.File(temporary_path, "w") as output_file:
+            for category, embedding in embeddings.items():
+                output_file.create_dataset(category, data=embedding)
+            output_file.attrs["model"] = model_name
+            output_file.attrs["num_categories"] = len(embeddings)
+            output_file.flush()
+        with temporary_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def annotated_image_filename(image_path, image_index):
@@ -298,7 +364,8 @@ def create_prototypes(args):
             
             for img_path in image_files:
                 try:
-                    img = Image.open(img_path).convert("RGB")
+                    with Image.open(img_path) as opened_image:
+                        img = opened_image.convert("RGB").copy()
                     inputs = processor(img, return_tensors="pt")
                     
                     inputs = {k: v.to(args.device) for k, v in inputs.items()}
@@ -315,8 +382,16 @@ def create_prototypes(args):
                     embedding = embedding.cpu().numpy()
                     cat_embeddings.append(embedding)
                     
-                except Exception as e:
-                    print(f"  Warning: Could not process {img_path}: {e}")
+                except Exception as error:
+                    print(
+                        "Error: every reference image must decode and produce "
+                        f"an embedding; failed at {img_path}: {error}"
+                    )
+                    print(
+                        "No new prototype file was published; any existing "
+                        "file was left unchanged."
+                    )
+                    return 1
             
             if cat_embeddings:
                 import numpy as np
@@ -332,14 +407,17 @@ def create_prototypes(args):
         print("No prototype file was written.")
         return 1
     
-    # Save to HDF5
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with h5py.File(output_path, "w") as f:
-        for category, embedding in embeddings.items():
-            f.create_dataset(category, data=embedding)
-        f.attrs["model"] = args.model
-        f.attrs["num_categories"] = len(embeddings)
+    try:
+        write_prototypes_atomically(
+            output_path,
+            embeddings,
+            args.model,
+            h5py,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Error: could not publish prototype file: {error}")
+        print("Any existing prototype file was left unchanged.")
+        return 1
     
     print(f"\nPrototypes saved to: {output_path}")
     print(f"Categories: {list(embeddings.keys())}")
@@ -431,58 +509,80 @@ def detect_objects(args):
     proto_tensor = proto_tensor / proto_tensor.norm(dim=-1, keepdim=True)
     proto_tensor = proto_tensor.to(args.device)
     
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Process input
-    if input_kind == "video":
-        # Video input
-        try:
-            process_video(input_path, output_path, owl_detector, clip_model,
-                          clip_processor, proto_tensor, prototype_names,
-                          first_stage_queries, args)
-        except (RuntimeError, ValueError) as error:
-            print(f"Error: {error}")
-            return 1
-    else:
-        # Single-image or image-folder input
-        all_detections = []
-        
-        preview_dir = output_path / "annotated_frames"
-        if args.save_frames:
-            preview_dir.mkdir(parents=True, exist_ok=True)
-
-        for image_index, img_path in enumerate(
-            tqdm(image_files, desc="Processing images"),
-            start=1,
-        ):
-            try:
-                with Image.open(img_path) as opened_image:
-                    source_image = opened_image.convert("RGB").copy()
-            except Exception as error:
-                print(f"Error: could not decode image {img_path}: {error}")
-                return 1
-            detections = process_image(
-                source_image, owl_detector, clip_model, clip_processor,
-                proto_tensor, prototype_names, first_stage_queries, args
+    staging_path = create_output_staging_directory(output_path)
+    try:
+        # Process input only inside the unpublished staging directory.
+        if input_kind == "video":
+            process_video(
+                input_path,
+                staging_path,
+                owl_detector,
+                clip_model,
+                clip_processor,
+                proto_tensor,
+                prototype_names,
+                first_stage_queries,
+                args,
             )
-            for det in detections:
-                det["image"] = img_path.name
-            all_detections.extend(detections)
+        else:
+            all_detections = []
+            preview_dir = staging_path / "annotated_frames"
             if args.save_frames:
-                preview = draw_detection_preview(source_image, detections)
-                preview.save(
-                    preview_dir
-                    / annotated_image_filename(img_path, image_index),
-                    quality=90,
-                )
+                preview_dir.mkdir(parents=True, exist_ok=True)
 
-        df, _summary = write_detection_tables(
-            all_detections,
-            output_path,
-            "images",
-        )
-        print(f"\nSaved {len(df)} detections to detections.csv")
-    
+            for image_index, img_path in enumerate(
+                tqdm(image_files, desc="Processing images"),
+                start=1,
+            ):
+                try:
+                    with Image.open(img_path) as opened_image:
+                        source_image = opened_image.convert("RGB").copy()
+                except Exception as error:
+                    raise RuntimeError(
+                        f"could not decode image {img_path}: {error}"
+                    ) from error
+                detections = process_image(
+                    source_image,
+                    owl_detector,
+                    clip_model,
+                    clip_processor,
+                    proto_tensor,
+                    prototype_names,
+                    first_stage_queries,
+                    args,
+                )
+                for det in detections:
+                    det["image"] = img_path.name
+                all_detections.extend(detections)
+                if args.save_frames:
+                    preview = draw_detection_preview(
+                        source_image,
+                        detections,
+                    )
+                    preview.save(
+                        preview_dir
+                        / annotated_image_filename(img_path, image_index),
+                        quality=90,
+                    )
+
+            df, _summary = write_detection_tables(
+                all_detections,
+                staging_path,
+                "images",
+            )
+            print(f"\nPrepared {len(df)} detections")
+
+        publish_output_directory(staging_path, output_path)
+        staging_path = None
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Error: {error}")
+        print("No partial detection output was published.")
+        return 1
+    finally:
+        if staging_path is not None and staging_path.exists():
+            shutil.rmtree(staging_path)
+
+    print(f"Results published to: {output_path}")
     return 0
 
 
@@ -556,26 +656,42 @@ def process_video(video_path, output_path, owl_detector, clip_model,
     from naturallab.media import VideoFileSource
     
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open video file: {video_path}")
-    reported_total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    total_frames = (
-        int(reported_total_frames)
-        if math.isfinite(reported_total_frames)
-        and reported_total_frames > 0
-        else 0
-    )
-    reported_fps = float(cap.get(cv2.CAP_PROP_FPS))
-    fps = (
-        reported_fps
-        if math.isfinite(reported_fps) and reported_fps > 0
-        else None
-    )
-    cap.release()
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"could not open video file: {video_path}")
+        reported_total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = (
+            int(reported_total_frames)
+            if math.isfinite(reported_total_frames)
+            and reported_total_frames > 0
+            else 0
+        )
+        if total_frames == 0:
+            raise RuntimeError(
+                "video does not report a trustworthy positive frame count: "
+                f"{video_path}"
+            )
+        reported_fps = float(cap.get(cv2.CAP_PROP_FPS))
+        fps = (
+            reported_fps
+            if math.isfinite(reported_fps) and reported_fps > 0
+            else None
+        )
+        decoded, first_frame = cap.read()
+        if (
+            not decoded
+            or first_frame is None
+            or first_frame.size == 0
+        ):
+            raise RuntimeError(
+                f"video does not decode its first frame: {video_path}"
+            )
+    finally:
+        cap.release()
     
     print(
         "Video: "
-        f"{total_frames if total_frames else 'unknown'} frames @ "
+        f"{total_frames} frames @ "
         f"{fps if fps is not None else 'unknown'} nominal FPS"
     )
     
@@ -631,8 +747,12 @@ def process_video(video_path, output_path, owl_detector, clip_model,
                 quality=90,
             )
     
-    if processed_frames == 0:
-        raise RuntimeError(f"video contains no decodable frames: {video_path}")
+    if processed_frames != expected_frames:
+        raise RuntimeError(
+            "video decoding ended early after "
+            f"{processed_frames} of {expected_frames} requested sampled "
+            "frames; the input may be truncated"
+        )
 
     # Always write result tables, including their headers when no detection
     # passes the configured thresholds.
@@ -642,7 +762,7 @@ def process_video(video_path, output_path, owl_detector, clip_model,
         "video",
     )
 
-    print(f"\nSaved {len(df)} detections")
+    print(f"\nPrepared {len(df)} detections")
     print("\nDetection summary:")
     print(summary)
 

@@ -33,7 +33,8 @@ Use `python3.11` if Python 3.12 is unavailable. Install only the optional groups
 needed by the intended command:
 
 ```bash
-python -m pip install -e ".[spatial]"      # local tracking and pose tools
+python -m pip install -e ".[spatial]"      # tracking and floor-position support
+python -m pip install -e ".[yolo]"         # optional, separately licensed YOLO path
 python -m pip install -e ".[gaze]"         # object and gaze analysis
 python -m pip install -e ".[acquisition]"  # LSL, XDF, and timestamped Neon streams
 python -m pip install -e ".[qwen]"         # Qwen client + DeepSORT/OSNet
@@ -44,6 +45,7 @@ Then run the matching read-only preflight, for example:
 
 ```bash
 naturallab doctor --profile spatial
+naturallab doctor --profile yolo
 naturallab doctor --profile gaze
 naturallab doctor --profile acquisition
 ```
@@ -98,7 +100,7 @@ python scripts/track_people_in_video.py \
   --floor-calib calibration/camera-01/floor/floor.yaml
 ```
 
-## 3. Use the current operational Qwen/DeepSORT path
+## 3. Use the supported Qwen/DeepSORT client path
 
 This path requires an already deployed OpenAI-compatible service offering the
 exact model `Qwen/Qwen3.6-27B`. The repository contains its client adapter; it
@@ -128,7 +130,7 @@ python scripts/track_people_in_video.py \
 ```
 
 The doctor checks local configuration but does not contact the endpoint; the
-tracking command is the first end-to-end service request. The operational
+tracking command is the first end-to-end service request. The packaged
 preset pins an official OSNet-AIN x1.0 checkpoint by immutable revision, byte
 count, and SHA-256. Its first construction downloads and verifies the file when
 needed. Set `NATURALLAB_REID_MODEL_PATH` to a pre-staged copy of those exact
@@ -147,11 +149,12 @@ python scripts/track_people_in_video.py \
   --output results-qwen-roles \
   --detector qwen \
   --tracker deepsort \
-  --identities '{"child":"the infant participant","caregiver":"the adult caregiver participant"}'
+  --identities '{"participant":"the person completing the task","facilitator":"the person presenting the materials"}'
 ```
 
-The role assigner may abstain. A local track ID or role prediction is not, by
-itself, a cross-camera identity.
+The packaged preset contains no study-specific roles: every role and
+description comes from `--identities`. The role assigner may abstain. A local
+track ID or role prediction is not, by itself, a cross-camera identity.
 
 ## 4. Detect study-specific objects
 
@@ -244,12 +247,15 @@ recording and use shared-room output only after its report passes.
 ## 6. Validate a study manifest
 
 Copy [`examples/study_manifest.yaml`](../examples/study_manifest.yaml), replace
-its illustrative paths, and inspect the contract:
+its illustrative paths, use pseudonymous identifiers, and save the real copy in
+the ignored `private-study-data/` directory (or the study's access-controlled
+data store) if it contains private paths or participant-related metadata. Then
+inspect the contract:
 
 ```bash
-naturallab study validate session.yaml
-naturallab study plan session.yaml
-naturallab study status session.yaml
+naturallab study validate private-study-data/session.yaml
+naturallab study plan private-study-data/session.yaml
+naturallab study status private-study-data/session.yaml
 ```
 
 These commands do not run analysis or create state. Concrete applications must
