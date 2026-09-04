@@ -355,9 +355,7 @@ Tracking applies the recorded input rotation, checks the exact image size, and
 validates that the floor artifact is bound to the supplied intrinsic hash.
 
 Repeat the per-camera stages separately for every camera. Per-camera
-calibration is sufficient for floor contact points and trajectories. It is not
-by itself a multi-camera 3D skeleton calibration; see
-[Multiview 3D readiness](multiview_3d_readiness.md).
+calibration is sufficient for floor contact points and trajectories.
 
 ## Failure messages
 

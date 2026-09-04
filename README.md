@@ -27,8 +27,7 @@ active development work.
 
 The first two guides distinguish an operational smoke test from scientific
 validation. In particular, host-arrival timestamps are not proof of
-millisecond-accurate capture synchronization, and a floor-only registration is
-not a validated person-volume 3D reconstruction.
+millisecond-accurate capture synchronization.
 
 ## What can be run now
 
@@ -256,9 +255,7 @@ compatibility script can still read the repository's older `dist_coeffs` and
 `plane_normal`/`plane_d` files.
 
 Read the full [automatic calibration workflow](docs/calibration_workflow.md)
-before recording. Per-camera floor calibration does not establish the relative
-camera poses required for 3D skeleton triangulation; see the
-[multiview 3D readiness assessment](docs/multiview_3d_readiness.md).
+before recording.
 
 ## Reference-image object detection
 

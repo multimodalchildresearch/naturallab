@@ -9,9 +9,7 @@ This guide describes the current library contracts and the study manifest. The
 not launch model services or execute analysis steps.
 
 For recording and calibrating a camera, follow the separate
-[automatic calibration workflow](calibration_workflow.md). For the distinction
-between per-camera floor geometry and multiview skeleton reconstruction, see
-[multiview 3D readiness](multiview_3d_readiness.md).
+[automatic calibration workflow](calibration_workflow.md).
 
 ## Choose the boundary you actually need
 
@@ -22,15 +20,13 @@ between per-camera floor geometry and multiview skeleton reconstruction, see
 | Per-view floor trajectories and distance | One calibrated camera view | Yes, for that view | No |
 | Registered room coordinates | Any explicit set of calibrated views | Floor calibration plus a rigid view-to-room transform for each view | No |
 | Fused cross-view trajectory | Registered observations with synchronized timestamps | Yes | Yes, an explicit shared identity |
-| 3D skeleton triangulation | Synchronized 2D joints from overlapping views | Shared camera extrinsics and intrinsics; floor planes alone are insufficient | Yes |
 | Gaze-to-object assignment | Gaze points and object boxes in the same named view and time base | Image dimensions only for normalized gaze | No |
 | Multimodal alignment | Timestamped records and declared tolerances | No | No |
 
 The default is to retain evidence per view. Room registration changes
 coordinates; it does not imply that two local tracks are the same person.
 Fusion is a separate, opt-in operation. The current room-registration/fusion
-API operates on reconstructed floor points; it does not triangulate image-space
-skeleton joints.
+API operates on reconstructed floor points.
 
 ## 1. Describe one study session
 
@@ -445,6 +441,3 @@ Before a production analysis:
 6. Keep gaze/object overlap abstentions and missing modalities in the output.
 7. Save model ID, preset version, prompt versions, calibration hashes, and run
    state with the derived data.
-8. Do not label output as a 3D skeleton unless shared camera extrinsics,
-   synchronization residuals, triangulation quality, and metric validation are
-   all recorded.

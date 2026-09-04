@@ -204,7 +204,6 @@ click endpoints, or invent a scale correction.
 - Measuring actual distances (meters, feet)
 - Converting pixel positions to floor coordinates
 - Correcting lens distortion
-- Preparing one part of a later multi-camera 3D reconstruction
 
 ### Calibration Steps
 
@@ -267,15 +266,6 @@ naturallab calibrate verify \
 The command reports measured-versus-known board spans, absolute and percentage
 error, and a `PASS`, `WARNING`, or `FAIL` screening result. Verification never
 refits the calibration.
-
-### Important Boundary
-
-Per-camera intrinsics and floor planes are sufficient for metric points that
-are assumed to touch the floor. They are not sufficient to triangulate
-arbitrary 3D skeleton joints. Four-camera 3D additionally needs relative
-camera extrinsics in one room frame, synchronized frames, cross-view
-correspondence, and a triangulation/validation stage. See
-[Multiview 3D readiness](multiview_3d_readiness.md).
 
 ### Recording Tips
 

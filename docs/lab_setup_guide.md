@@ -333,8 +333,7 @@ Use `room-registration.yaml` only when `extrinsics-report.json` says
 camera.
 The detailed [automatic calibration reference](calibration_workflow.md)
 explains file preparation and report fields. Floor registration supports room
-movement measurements; read [multiview 3D readiness](multiview_3d_readiness.md)
-before attempting elevated 3D skeleton reconstruction.
+movement measurements.
 
 ## 9. Choose what to analyze
 

@@ -16,7 +16,6 @@ REQUIRED_PUBLIC_FILES = (
     "docs/lab_setup_guide.md",
     "docs/object_detection_guide.md",
     "docs/calibration_workflow.md",
-    "docs/multiview_3d_readiness.md",
     "docs/researcher_workflow.md",
     "examples/study_manifest.yaml",
     "examples/shared_board_extrinsics.yaml",

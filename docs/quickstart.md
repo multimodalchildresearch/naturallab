@@ -235,8 +235,7 @@ naturallab calibrate extrinsics \
 ```
 
 Read the [automatic calibration workflow](calibration_workflow.md) before
-recording. A passing floor-only shared-room report does not establish
-person-volume 3D accuracy; see [multiview 3D readiness](multiview_3d_readiness.md).
+recording and use shared-room output only after its report passes.
 
 ## 6. Validate a study manifest
 
