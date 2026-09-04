@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Detect Custom Objects with Prototype Matching
-==============================================
+Detect Custom Objects from Reference Images
+============================================
 
-Zero-shot object detection using OWL-ViT + CLIP prototype matching.
-No training required - just provide reference images of your objects.
+Reference-image object detection using OWLv2 + CLIP prototype matching.
+No gradient-based training is required: provide photographs of the objects.
 
 Use Cases:
 - Inventory tracking with custom products
@@ -16,19 +16,20 @@ Use Cases:
 Example Usage:
     # Create prototypes from reference images
     python detect_custom_objects.py create-prototypes \\
-        --images reference_images/ \\
-        --output prototypes.h5
+        --images private-study-data/reference_images/ \\
+        --output private-study-data/prototypes.h5
     
     # Detect objects in video frames
     python detect_custom_objects.py detect \\
-        --input video.mp4 \\
-        --prototypes prototypes.h5 \\
-        --output detections/
+        --input private-study-data/video.mp4 \\
+        --prototypes private-study-data/prototypes.h5 \\
+        --output private-study-data/detection-run-01/
     
     # Detect in image folder
     python detect_custom_objects.py detect \\
-        --input frames/ \\
-        --prototypes prototypes.h5 \\
+        --input private-study-data/frames/ \\
+        --prototypes private-study-data/prototypes.h5 \\
+        --output private-study-data/image-run-01/ \\
         --categories '{"toy": ["toy", "object"], "tool": ["tool", "instrument"]}'
 """
 
@@ -56,6 +57,23 @@ VIDEO_SUFFIXES = frozenset(
         ".webm",
     }
 )
+BASE_DETECTION_COLUMNS = (
+    "x",
+    "y",
+    "width",
+    "height",
+    "detection_score",
+    "category",
+    "match_score",
+)
+VIDEO_DETECTION_COLUMNS = (
+    *BASE_DETECTION_COLUMNS,
+    "frame",
+    "timestamp",
+    "timestamp_seconds",
+    "timestamp_ns",
+    "timestamp_source",
+)
 
 
 def discover_media_files(directory, suffixes):
@@ -72,6 +90,93 @@ def discover_media_files(directory, suffixes):
     )
 
 
+def classify_detection_input(input_path):
+    """Return the supported input kind and any discovered image files."""
+    input_path = Path(input_path)
+    if input_path.is_file():
+        suffix = input_path.suffix.lower()
+        if suffix in IMAGE_SUFFIXES:
+            return "images", [input_path]
+        if suffix in VIDEO_SUFFIXES:
+            return "video", []
+        raise ValueError(
+            f"unsupported input file type: {input_path.suffix or '(none)'}"
+        )
+    if input_path.is_dir():
+        image_files = discover_media_files(input_path, IMAGE_SUFFIXES)
+        if not image_files:
+            raise ValueError(f"no supported images found in {input_path}")
+        return "images", image_files
+    raise ValueError(f"input does not exist: {input_path}")
+
+
+def require_empty_output_directory(output_path):
+    """Refuse to mix a new run with files from an earlier configuration."""
+    output_path = Path(output_path)
+    if output_path.exists() and not output_path.is_dir():
+        raise ValueError(f"output path is not a directory: {output_path}")
+    if output_path.exists() and any(output_path.iterdir()):
+        raise ValueError(
+            f"output directory is not empty: {output_path}; choose a new run name"
+        )
+
+
+def annotated_image_filename(image_path, image_index):
+    """Return a stable, collision-free preview name for one source image."""
+    safe_stem = Path(image_path).stem or "image"
+    return f"image_{image_index:06d}_{safe_stem}_detections.jpg"
+
+
+def write_detection_tables(detections, output_path, media_kind):
+    """Write stable CSV schemas, including for valid zero-detection runs."""
+    import pandas as pd
+
+    output_path = Path(output_path)
+    if media_kind == "video":
+        frame = pd.DataFrame(detections, columns=VIDEO_DETECTION_COLUMNS)
+    elif media_kind == "images":
+        frame = pd.DataFrame(
+            detections,
+            columns=(*BASE_DETECTION_COLUMNS, "image"),
+        )
+    else:
+        raise ValueError(f"unsupported media kind: {media_kind}")
+    frame.to_csv(output_path / "detections.csv", index=False)
+
+    if media_kind == "video":
+        summary = frame.groupby("category").agg(
+            count=("frame", "count"),
+            avg_confidence=("match_score", "mean"),
+        )
+        summary.to_csv(output_path / "detection_summary.csv")
+        return frame, summary
+    return frame, None
+
+
+def parse_category_queries(value):
+    """Validate optional JSON search phrases and return one flat query list."""
+    if not value:
+        return ["object", "thing"]
+    try:
+        categories = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"--categories is not valid JSON: {error}") from error
+    if not isinstance(categories, dict) or not categories or not all(
+        isinstance(queries, list)
+        and queries
+        and all(
+            isinstance(query, str) and query.strip()
+            for query in queries
+        )
+        for queries in categories.values()
+    ):
+        raise ValueError(
+            "--categories must map each label to a non-empty list of search "
+            "phrases"
+        )
+    return [query for queries in categories.values() for query in queries]
+
+
 def resolve_torch_device(requested, torch_module):
     """Resolve ``auto`` and reject unavailable explicitly requested CUDA."""
     if requested == "auto":
@@ -86,6 +191,30 @@ def resolve_torch_device(requested, torch_module):
     if requested == "cuda" and not torch_module.cuda.is_available():
         raise ValueError("--device cuda was requested, but CUDA is unavailable")
     return requested
+
+
+def draw_detection_preview(image, detections):
+    """Return a copy of a PIL image with readable detection overlays."""
+    from PIL import ImageDraw
+
+    preview = image.copy()
+    draw = ImageDraw.Draw(preview)
+    for detection in detections:
+        x = int(detection["x"])
+        y = int(detection["y"])
+        width = int(detection["width"])
+        height = int(detection["height"])
+        right = x + width
+        bottom = y + height
+        draw.rectangle((x, y, right, bottom), outline="lime", width=3)
+        label = (
+            f'{detection["category"]} '
+            f'{float(detection["match_score"]):.2f}'
+        )
+        text_y = max(0, y - 14)
+        draw.text((x + 2, text_y), label, fill="lime", stroke_fill="black",
+                  stroke_width=2)
+    return preview
 
 
 def create_prototypes(args):
@@ -118,29 +247,41 @@ def create_prototypes(args):
         print(f"Error: {error}")
         return 1
 
-    # Load CLIP model
-    print("Loading CLIP model...")
-    model = AutoModel.from_pretrained(args.model).eval().to(args.device)
-    processor = AutoImageProcessor.from_pretrained(args.model)
-    
     # Discover images organized by category
     # Expected structure: images_dir/category_name/image1.jpg
     categories = {}
-    
-    if images_path.is_dir():
-        for category_dir in images_path.iterdir():
-            if category_dir.is_dir():
-                image_files = discover_media_files(
-                    category_dir,
-                    IMAGE_SUFFIXES,
-                )
-                if image_files:
-                    categories[category_dir.name] = image_files
-    
-    if not categories:
+
+    category_directories = (
+        sorted(
+            (path for path in images_path.iterdir() if path.is_dir()),
+            key=lambda path: path.name.casefold(),
+        )
+        if images_path.is_dir()
+        else []
+    )
+    if not category_directories:
         print("Error: No image categories found.")
         print("Expected structure: images_dir/category_name/image1.jpg")
         return 1
+
+    empty_categories = []
+    for category_dir in category_directories:
+        image_files = discover_media_files(category_dir, IMAGE_SUFFIXES)
+        if image_files:
+            categories[category_dir.name] = image_files
+        else:
+            empty_categories.append(category_dir.name)
+    if empty_categories:
+        print(
+            "Error: Every category folder must contain at least one supported "
+            "image. Empty categories: " + ", ".join(empty_categories)
+        )
+        return 1
+
+    # Load CLIP only after the folder layout has passed validation.
+    print("Loading CLIP model...")
+    model = AutoModel.from_pretrained(args.model).eval().to(args.device)
+    processor = AutoImageProcessor.from_pretrained(args.model)
     
     print(f"Found {len(categories)} categories:")
     for cat, files in categories.items():
@@ -181,6 +322,15 @@ def create_prototypes(args):
                 import numpy as np
                 # Average embeddings for this category
                 embeddings[category] = np.mean(np.vstack(cat_embeddings), axis=0)
+
+    failed_categories = sorted(set(categories) - set(embeddings))
+    if failed_categories:
+        print(
+            "Error: No usable reference image could be decoded for: "
+            + ", ".join(failed_categories)
+        )
+        print("No prototype file was written.")
+        return 1
     
     # Save to HDF5
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,7 +351,7 @@ def detect_objects(args):
     """Detect objects using prototypes."""
     import torch
     import h5py
-    import pandas as pd
+    from PIL import Image
     from tqdm import tqdm
     
     input_path = Path(args.input)
@@ -211,11 +361,17 @@ def detect_objects(args):
     if args.frame_skip < 1:
         print("Error: --frame-skip must be positive")
         return 1
-    if not input_path.exists():
-        print(f"Error: Input does not exist: {input_path}")
+    if args.frame_interval < 1:
+        print("Error: --frame-interval must be positive")
         return 1
     if not prototypes_path.is_file():
         print(f"Error: Prototype file does not exist: {prototypes_path}")
+        return 1
+    try:
+        input_kind, image_files = classify_detection_input(input_path)
+        require_empty_output_directory(output_path)
+    except ValueError as error:
+        print(f"Error: {error}")
         return 1
     
     print("=" * 60)
@@ -232,16 +388,19 @@ def detect_objects(args):
         prototype_names = list(f.keys())
         prototypes = {name: torch.tensor(f[name][:]) for name in prototype_names}
         model_name = f.attrs.get("model", "openai/clip-vit-base-patch32")
+
+    if not prototypes:
+        print("Error: Prototype file contains no categories")
+        return 1
     
     print(f"Loaded {len(prototypes)} prototype categories: {prototype_names}")
     
     # Parse category queries for first stage
-    first_stage_queries = ["object", "thing"]
-    if args.categories:
-        categories = json.loads(args.categories)
-        first_stage_queries = []
-        for queries in categories.values():
-            first_stage_queries.extend(queries)
+    try:
+        first_stage_queries = parse_category_queries(args.categories)
+    except ValueError as error:
+        print(f"Error: {error}")
+        return 1
     
     # Load models
     print("Loading detection models...")
@@ -275,39 +434,54 @@ def detect_objects(args):
     output_path.mkdir(parents=True, exist_ok=True)
     
     # Process input
-    input_suffix = input_path.suffix.lower()
-    if input_path.is_file() and (
-        input_suffix in VIDEO_SUFFIXES
-        or input_suffix not in IMAGE_SUFFIXES
-    ):
+    if input_kind == "video":
         # Video input
-        process_video(input_path, output_path, owl_detector, clip_model, 
-                     clip_processor, proto_tensor, prototype_names,
-                     first_stage_queries, args)
+        try:
+            process_video(input_path, output_path, owl_detector, clip_model,
+                          clip_processor, proto_tensor, prototype_names,
+                          first_stage_queries, args)
+        except (RuntimeError, ValueError) as error:
+            print(f"Error: {error}")
+            return 1
     else:
         # Single-image or image-folder input
-        image_files = (
-            [input_path]
-            if input_path.is_file()
-            else discover_media_files(input_path, IMAGE_SUFFIXES)
-        )
-        
         all_detections = []
         
-        for img_path in tqdm(image_files, desc="Processing images"):
+        preview_dir = output_path / "annotated_frames"
+        if args.save_frames:
+            preview_dir.mkdir(parents=True, exist_ok=True)
+
+        for image_index, img_path in enumerate(
+            tqdm(image_files, desc="Processing images"),
+            start=1,
+        ):
+            try:
+                with Image.open(img_path) as opened_image:
+                    source_image = opened_image.convert("RGB").copy()
+            except Exception as error:
+                print(f"Error: could not decode image {img_path}: {error}")
+                return 1
             detections = process_image(
-                img_path, owl_detector, clip_model, clip_processor,
+                source_image, owl_detector, clip_model, clip_processor,
                 proto_tensor, prototype_names, first_stage_queries, args
             )
             for det in detections:
                 det["image"] = img_path.name
             all_detections.extend(detections)
-        
-        # Save results
-        if all_detections:
-            df = pd.DataFrame(all_detections)
-            df.to_csv(output_path / "detections.csv", index=False)
-            print(f"\nSaved {len(df)} detections to detections.csv")
+            if args.save_frames:
+                preview = draw_detection_preview(source_image, detections)
+                preview.save(
+                    preview_dir
+                    / annotated_image_filename(img_path, image_index),
+                    quality=90,
+                )
+
+        df, _summary = write_detection_tables(
+            all_detections,
+            output_path,
+            "images",
+        )
+        print(f"\nSaved {len(df)} detections to detections.csv")
     
     return 0
 
@@ -376,7 +550,6 @@ def process_video(video_path, output_path, owl_detector, clip_model,
     """Process video and save detections."""
     import cv2
     import math
-    import pandas as pd
     from PIL import Image
     from tqdm import tqdm
 
@@ -407,6 +580,10 @@ def process_video(video_path, output_path, owl_detector, clip_model,
     )
     
     all_detections = []
+    processed_frames = 0
+    preview_dir = output_path / "annotated_frames"
+    if args.save_frames:
+        preview_dir.mkdir(parents=True, exist_ok=True)
     
     # Process every Nth frame
     frame_skip = args.frame_skip or 1
@@ -424,6 +601,7 @@ def process_video(video_path, output_path, owl_detector, clip_model,
     ):
         frame_idx = packet.frame_index
         frame = packet.image
+        processed_frames += 1
 
         # Convert to PIL
         img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
@@ -445,27 +623,33 @@ def process_video(video_path, output_path, owl_detector, clip_model,
             )
         
         all_detections.extend(detections)
+
+        if args.save_frames and frame_idx % args.frame_interval == 0:
+            preview = draw_detection_preview(img, detections)
+            preview.save(
+                preview_dir / f"frame_{frame_idx:08d}.jpg",
+                quality=90,
+            )
     
-    # Save results
-    if all_detections:
-        df = pd.DataFrame(all_detections)
-        df.to_csv(output_path / "detections.csv", index=False)
-        
-        # Summary statistics
-        summary = df.groupby("category").agg({
-            "frame": "count",
-            "match_score": "mean"
-        }).rename(columns={"frame": "count", "match_score": "avg_confidence"})
-        summary.to_csv(output_path / "detection_summary.csv")
-        
-        print(f"\nSaved {len(df)} detections")
-        print("\nDetection summary:")
-        print(summary)
+    if processed_frames == 0:
+        raise RuntimeError(f"video contains no decodable frames: {video_path}")
+
+    # Always write result tables, including their headers when no detection
+    # passes the configured thresholds.
+    df, summary = write_detection_tables(
+        all_detections,
+        output_path,
+        "video",
+    )
+
+    print(f"\nSaved {len(df)} detections")
+    print("\nDetection summary:")
+    print(summary)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Zero-shot object detection with prototype matching",
+        description="Reference-image object detection with prototype matching",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -505,6 +689,17 @@ def main():
                               help="Prototype match threshold (default: 0.3)")
     detect_parser.add_argument("--frame-skip", type=int, default=1,
                               help="Process every Nth frame (default: 1)")
+    detect_parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help="Save annotated JPEG frames for visual review",
+    )
+    detect_parser.add_argument(
+        "--frame-interval",
+        type=int,
+        default=100,
+        help="For video, save one annotated frame every N source frames",
+    )
     detect_parser.add_argument(
         "--device",
         choices=["auto", "cpu", "cuda", "mps"],

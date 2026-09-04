@@ -151,10 +151,12 @@ itself, a cross-camera identity.
 
 ## 4. Detect study-specific objects
 
-Arrange reference photographs as one directory per category:
+This path uses photographs of the lab's actual objects and does not require a
+conventional model-training run. Arrange the photographs as one directory per
+category:
 
 ```text
-reference_images/
+private-study-data/reference_images/
 ├── ball/
 │   ├── ball_01.jpg
 │   └── ball_02.jpg
@@ -166,20 +168,25 @@ Create prototypes, then apply them to a video, image, or image directory:
 
 ```bash
 python scripts/detect_custom_objects.py create-prototypes \
-  --images reference_images \
-  --output prototypes.h5 \
+  --images private-study-data/reference_images \
+  --output private-study-data/prototypes.h5 \
   --device auto
 
 python scripts/detect_custom_objects.py detect \
-  --input your_video.mp4 \
-  --prototypes prototypes.h5 \
-  --output object-results \
-  --device auto
+  --input private-study-data/your_video.mp4 \
+  --prototypes private-study-data/prototypes.h5 \
+  --output private-study-data/object-run-01 \
+  --device auto \
+  --save-frames
 ```
 
-Inspect `detections.csv` and, for video, `detection_summary.csv`. Prototype
-quality and thresholds must be evaluated on held-out study footage; this smoke
-test does not establish detection accuracy.
+Inspect `annotated_frames/`, `detections.csv`, and, for video,
+`detection_summary.csv`. Prototype quality and thresholds must be evaluated on
+held-out study footage; this smoke test does not establish detection accuracy.
+The [object detector setup guide](object_detection_guide.md) explains how to
+take useful reference photographs, tune on a separate clip, and prepare an
+external training handoff when prototypes are insufficient. NaturalLab does
+not currently provide a `train` command.
 
 ## 5. Run automatic calibration
 

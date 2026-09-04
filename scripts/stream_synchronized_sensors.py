@@ -52,6 +52,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 running = True
 
 
+def parse_comma_separated(parser, value, option):
+    """Parse one non-empty comma-separated CLI option."""
+    if value is None:
+        return []
+    items = [item.strip() for item in value.split(",")]
+    if not items or any(not item for item in items):
+        parser.error(f"{option} must not contain empty entries")
+    return items
+
+
 def signal_handler(signum, frame):
     global running
     print("\nShutting down streams...")
@@ -324,6 +334,28 @@ def main():
                        help="Enable RealSense depth camera")
     
     args = parser.parse_args()
+
+    camera_urls = parse_comma_separated(parser, args.cameras, "--cameras")
+    camera_names = parse_comma_separated(
+        parser,
+        args.camera_names,
+        "--camera-names",
+    )
+    if camera_names and not camera_urls:
+        parser.error("--camera-names requires --cameras")
+    if camera_names and len(camera_names) != len(camera_urls):
+        parser.error("--camera-names must contain one name per camera URL")
+
+    neon_ips = parse_comma_separated(parser, args.neon_ips, "--neon-ips")
+    neon_names = parse_comma_separated(
+        parser,
+        args.neon_names,
+        "--neon-names",
+    )
+    if neon_names and not neon_ips:
+        parser.error("--neon-names requires --neon-ips")
+    if neon_names and len(neon_names) != len(neon_ips):
+        parser.error("--neon-names must contain one name per Neon IP")
     
     # Setup signal handler
     signal.signal(signal.SIGINT, signal_handler)
@@ -337,13 +369,12 @@ def main():
     print()
     
     # Start camera streams
-    if args.cameras:
-        urls = [u.strip() for u in args.cameras.split(",")]
-        names = [f"Camera{i+1}" for i in range(len(urls))]
-        if args.camera_names:
-            names = [n.strip() for n in args.camera_names.split(",")]
+    if camera_urls:
+        names = [f"Camera{i+1}" for i in range(len(camera_urls))]
+        if camera_names:
+            names = camera_names
         
-        for url, name in zip(urls, names):
+        for url, name in zip(camera_urls, names):
             t = threading.Thread(target=stream_rtsp_camera, 
                                args=(url, name, args.camera_quality))
             t.daemon = True
@@ -351,13 +382,12 @@ def main():
             threads.append(t)
     
     # Start Neon streams
-    if args.neon_ips:
-        ips = [ip.strip() for ip in args.neon_ips.split(",")]
-        names = [f"Neon{i+1}" for i in range(len(ips))]
-        if args.neon_names:
-            names = [n.strip() for n in args.neon_names.split(",")]
+    if neon_ips:
+        names = [f"Neon{i+1}" for i in range(len(neon_ips))]
+        if neon_names:
+            names = neon_names
         
-        for ip, name in zip(ips, names):
+        for ip, name in zip(neon_ips, names):
             t = threading.Thread(target=stream_neon_device, args=(ip, name))
             t.daemon = True
             t.start()

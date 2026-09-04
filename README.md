@@ -4,18 +4,21 @@ NaturalLab is a research pipeline for person tracking, room-scale movement,
 egocentric object detection, gaze analysis, and multimodal sensor data.
 
 The repository is being consolidated into task-oriented workflows. The current
-foundation is usable for environment checks, external video input, per-camera
-calibration contracts, person tracking, Qwen person grounding and role
-assignment, prototype-based object detection, explicit multiview registration
-and fusion, gaze/object alignment, and resumable study contracts. Concrete
-end-to-end study executors and the guided UI remain active development work.
+foundation is usable for a guided recording setup, environment checks, external
+video input, automatic camera calibration, person tracking, Qwen person
+grounding and role assignment, reference-image object detection, explicit
+multiview registration and fusion, gaze/object alignment, and resumable study
+contracts. Concrete end-to-end study executors and a guided analysis UI remain
+active development work.
 
 ## Start here
 
-- [Laboratory setup and first-recording guide](docs/lab_setup_guide.md): an
-  ordered checklist for mounting and networking devices, LSL/LabRecorder,
-  timing checks, automatic calibration, a two-minute acceptance recording,
-  extraction, initial processing, and data safety.
+- [Laboratory setup and first-recording guide](docs/lab_setup_guide.md): a
+  beginner-oriented walkthrough from connecting cameras to a router through a
+  checked test recording and automatic calibration.
+- [Object detector setup](docs/object_detection_guide.md): how to photograph
+  study objects, build and check reference-image prototypes, and decide when a
+  separately trained detector is warranted.
 - [Software quick start](docs/quickstart.md): install the package and run
   individual components on existing footage.
 - [Researcher workflow](docs/researcher_workflow.md): library contracts for
@@ -32,6 +35,7 @@ not a validated person-volume 3D reconstruction.
 | Workflow | Current entry point | Status |
 |---|---|---|
 | Check an installation | `naturallab doctor` | Ready |
+| Configure cameras/sensors and open LabRecorder | `naturallab record` | Ready on a desktop with Tk; four shared-credential camera rows |
 | Validate, plan, or inspect a study manifest | `naturallab study` | Ready, read-only CLI |
 | Read arbitrary video, image sequences, or Python frame iterables | `naturallab.media` | Ready as a library API |
 | Track people in a video with YOLO, OWLv2, or Qwen | `scripts/track_people_in_video.py` | Compatibility CLI |
@@ -39,7 +43,7 @@ not a validated person-volume 3D reconstruction.
 | Automatically calibrate intrinsics, floor plane, shared-room geometry, and verification | `naturallab calibrate` | Ready, click-free CLI |
 | Validate and consume versioned calibration artifacts | `naturallab.spatial_tracking.calibration` | Ready as a library API |
 | Register/fuse arbitrary calibrated views | `naturallab.spatial_tracking.multiview` | Ready as a library API |
-| Build object prototypes and detect them in video or images | `scripts/detect_custom_objects.py` | Compatibility CLI |
+| Build reference-image prototypes and detect them in video or images | `scripts/detect_custom_objects.py` | Compatibility CLI |
 | Assign gaze and align timestamped modalities | `naturallab.gaze_analysis` | Ready as a library API |
 | Stream or extract timestamped sensor data | `naturallab.acquisition` | Hardware-specific, optional |
 
@@ -256,12 +260,12 @@ before recording. Per-camera floor calibration does not establish the relative
 camera poses required for 3D skeleton triangulation; see the
 [multiview 3D readiness assessment](docs/multiview_3d_readiness.md).
 
-## Prototype-based object detection
+## Reference-image object detection
 
 Reference images are organized as one directory per category:
 
 ```text
-reference_images/
+private-study-data/reference_images/
 ├── ball/
 │   ├── ball_01.jpg
 │   └── ball_02.jpg
@@ -273,20 +277,24 @@ Create prototypes and apply them to a video, single image, or image directory:
 
 ```bash
 python scripts/detect_custom_objects.py create-prototypes \
-  --images reference_images \
-  --output prototypes.h5 \
+  --images private-study-data/reference_images \
+  --output private-study-data/prototypes.h5 \
   --device auto
 
 python scripts/detect_custom_objects.py detect \
-  --input scene_video.mp4 \
-  --prototypes prototypes.h5 \
-  --output detections \
-  --device auto
+  --input private-study-data/scene_video.mp4 \
+  --prototypes private-study-data/prototypes.h5 \
+  --output private-study-data/detection-run-01 \
+  --device auto \
+  --save-frames
 ```
 
 This pathway writes `detections.csv` and, for video input,
-`detection_summary.csv`. Video detections include the source timestamp in
-seconds and nanoseconds plus whether it came from container PTS or nominal FPS.
+`detection_summary.csv`; annotated review frames are optional. Video detections
+include the source timestamp in seconds and nanoseconds plus whether it came
+from container PTS or nominal FPS. Read the
+[object detector setup guide](docs/object_detection_guide.md) before collecting
+reference photos or deciding to train a separate model.
 
 ## Qwen preset and reproducibility
 
@@ -342,7 +350,7 @@ The remaining implementation order is:
 1. Stable end-to-end executors for the study manifest steps.
 2. Cross-view identity evidence and fusion QC.
 3. Stable installed console subcommands and task-oriented demo data.
-4. A guided UI.
+4. A guided analysis UI beyond the existing recording window.
 
 NaturalLab is licensed under the MIT License. Clone the public repository from
 [multimodalchildresearch/naturallab](https://github.com/multimodalchildresearch/naturallab)

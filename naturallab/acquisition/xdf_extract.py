@@ -32,99 +32,111 @@ except ImportError as error:
         "tqdm is required; install NaturalLab's core dependencies"
     ) from error
 
+def _decode_lsl_video_frame(frame_data, frame_index, stream_name):
+    """Decode one base64 JPEG frame or fail without changing frame indices."""
+    try:
+        if isinstance(frame_data, np.ndarray):
+            if frame_data.size == 0:
+                raise ValueError("empty frame sample")
+            frame_str = frame_data.reshape(-1)[0]
+        elif isinstance(frame_data, list):
+            if not frame_data:
+                raise ValueError("empty frame sample")
+            frame_str = frame_data[0]
+        else:
+            frame_str = frame_data
+        jpeg_data = base64.b64decode(frame_str, validate=True)
+        frame = cv2.imdecode(np.frombuffer(jpeg_data, np.uint8), cv2.IMREAD_COLOR)
+    except Exception as error:
+        raise RuntimeError(
+            f"could not decode frame {frame_index} from {stream_name}: {error}"
+        ) from error
+    if frame is None:
+        raise RuntimeError(
+            f"could not decode frame {frame_index} from {stream_name}"
+        )
+    return frame
+
+
 def extract_video_stream(stream, output_dir, name=None):
-    """Extract a video stream from XDF to MP4 without saving individual frames"""
+    """Extract a video stream while preserving 1:1 timestamp row alignment."""
     stream_name = name or stream['info']['name'][0]
     print(f"Extracting video stream: {stream_name}")
-    
-    # Output MP4 file
+
     output_file = os.path.join(output_dir, f"{stream_name}.mp4")
-    
-    # Extract timestamps and frame data
+    partial_file = os.path.join(output_dir, f".{stream_name}.partial.mp4")
     timestamps = stream['time_stamps']
     frames_data = stream['time_series']
-    
+
     if frames_data is None or len(frames_data) == 0:
-        print(f"No data found in video stream: {stream_name}")
-        return
-    
-    # Determine frame rate from timestamps
-    frame_intervals = np.diff(timestamps)
-    avg_interval = np.mean(frame_intervals) if len(frame_intervals) > 0 else 1/30
+        raise RuntimeError(f"no video frames found in stream: {stream_name}")
+    if len(timestamps) != len(frames_data):
+        raise RuntimeError(
+            f"video/timestamp length mismatch for {stream_name}: "
+            f"{len(frames_data)} frames and {len(timestamps)} timestamps"
+        )
+
+    try:
+        timestamp_values = np.asarray(timestamps, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"video timestamps are not numeric for {stream_name}"
+        ) from error
+    if not np.all(np.isfinite(timestamp_values)):
+        raise RuntimeError(
+            f"video timestamps are not finite for {stream_name}"
+        )
+    frame_intervals = np.diff(timestamp_values)
+    if len(frame_intervals) and np.any(frame_intervals <= 0):
+        raise RuntimeError(
+            f"video timestamps are not strictly increasing for {stream_name}"
+        )
+    avg_interval = np.mean(frame_intervals) if len(frame_intervals) > 0 else 1 / 30
     fps = 1.0 / avg_interval if avg_interval > 0 else 30
     print(f"Estimated frame rate: {fps:.2f} FPS")
-    
-    # Try to get the first frame to determine size
-    first_frame = None
-    for frame_index, frame_data in enumerate(frames_data):
-        try:
-            # Frames are stored as base64 encoded JPEG strings
-            if isinstance(frame_data, np.ndarray) and frame_data.size > 0:
-                frame_str = frame_data[0]
-            elif isinstance(frame_data, list) and len(frame_data) > 0:
-                frame_str = frame_data[0]
-            else:
-                frame_str = frame_data
-                
-            jpeg_data = base64.b64decode(frame_str)
-            nparr = np.frombuffer(jpeg_data, np.uint8)
-            first_frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if first_frame is not None:
-                break
-        except Exception as e:
-            print(f"Error decoding frame {frame_index}: {e}, trying next...")
-    
-    if first_frame is None:
-        print(f"Could not decode any frames for {stream_name}")
-        return
-    
-    # Get frame dimensions
+
+    first_frame = _decode_lsl_video_frame(frames_data[0], 0, stream_name)
     height, width = first_frame.shape[:2]
     print(f"Frame dimensions: {width}x{height}")
-    
-    # Create video writer
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video_writer = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
-    
-    # Process frames with progress bar
+    video_writer = cv2.VideoWriter(partial_file, fourcc, fps, (width, height))
+    if not video_writer.isOpened():
+        video_writer.release()
+        raise RuntimeError(f"could not create video file for {stream_name}")
+
     print(f"Processing {len(frames_data)} frames...")
-    for i, frame_data in enumerate(tqdm(frames_data)):
-        try:
-            # Get the frame string
-            if isinstance(frame_data, np.ndarray) and frame_data.size > 0:
-                frame_str = frame_data[0]
-            elif isinstance(frame_data, list) and len(frame_data) > 0:
-                frame_str = frame_data[0]
-            else:
-                frame_str = frame_data
-            
-            # Decode base64 encoded JPEG
-            jpeg_data = base64.b64decode(frame_str)
-            nparr = np.frombuffer(jpeg_data, np.uint8)
-            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            
-            if frame is None:
-                print(f"Warning: Could not decode frame {i}")
-                continue
-                
-            # Write frame to video
+    try:
+        for frame_index, frame_data in enumerate(tqdm(frames_data)):
+            frame = _decode_lsl_video_frame(
+                frame_data,
+                frame_index,
+                stream_name,
+            )
+            if frame.shape[:2] != (height, width):
+                raise RuntimeError(
+                    f"frame size changed at frame {frame_index} in "
+                    f"{stream_name}"
+                )
             video_writer.write(frame)
-            
-        except Exception as e:
-            print(f"Error processing frame {i}: {e}")
-    
-    # Release video writer
+    except Exception:
+        video_writer.release()
+        try:
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        raise
     video_writer.release()
-    
-    # Create a CSV with timestamps
+    os.replace(partial_file, output_file)
+
     timestamp_file = os.path.join(output_dir, f"{stream_name}_timestamps.csv")
     timestamp_df = pd.DataFrame({
-        'frame_index': range(len(timestamps)),
-        'timestamp': timestamps,
-        'datetime': [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
+        'frame_index': range(len(timestamp_values)),
+        'timestamp': timestamp_values,
+        'timestamp_domain': ['lsl'] * len(timestamp_values),
     })
     timestamp_df.to_csv(timestamp_file, index=False)
-    
+
     print(f"Video saved to: {output_file}")
     print(f"Timestamps saved to: {timestamp_file}")
 

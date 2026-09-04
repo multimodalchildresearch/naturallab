@@ -34,15 +34,16 @@ quality_limits:
 
 views:
   - view_id: camera-01
-    video: ../recordings/camera-01-floor.mp4
-    calibration_bundle: ../calibration/camera-01/calibration-bundle.yaml
-    # Added to frame_index / reported_fps to reach the common time base.
-    time_offset_seconds: 0.0
+    video: ../extracted/shared-board/camera-01.mp4
+    calibration_bundle: ../calibration/camera-01/floor/calibration-bundle.yaml
+    # The extractor writes this beside the MP4. NaturalLab derives the
+    # relative start offset automatically from its first timestamp.
+    timestamp_csv: ../extracted/shared-board/camera-01_timestamps.csv
   - view_id: camera-02
-    video: ../recordings/camera-02-floor.mp4
-    calibration_bundle: ../calibration/camera-02/calibration-bundle.yaml
-    time_offset_seconds: 0.0
+    video: ../extracted/shared-board/camera-02.mp4
+    calibration_bundle: ../calibration/camera-02/floor/calibration-bundle.yaml
+    timestamp_csv: ../extracted/shared-board/camera-02_timestamps.csv
   - view_id: camera-03
-    video: ../recordings/camera-03-floor.mp4
-    calibration_bundle: ../calibration/camera-03/calibration-bundle.yaml
-    time_offset_seconds: 0.0
+    video: ../extracted/shared-board/camera-03.mp4
+    calibration_bundle: ../calibration/camera-03/floor/calibration-bundle.yaml
+    timestamp_csv: ../extracted/shared-board/camera-03_timestamps.csv

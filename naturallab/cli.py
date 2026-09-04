@@ -265,6 +265,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit a machine-readable JSON report.",
     )
 
+    subparsers.add_parser(
+        "record",
+        help="Open the guided recording window.",
+        description=(
+            "Open the NaturalLab recording window for configuring cameras and "
+            "optional sensors, starting LSL streams, and launching LabRecorder."
+        ),
+    )
+
     study_parser = subparsers.add_parser(
         "study",
         help="Inspect a study/session manifest without running its steps.",
@@ -334,6 +343,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print(format_human(doctor_report))
         return doctor_report.exit_code
+
+    if args.command == "record":
+        from naturallab.acquisition.recording_gui import main as run_recorder
+
+        result = run_recorder()
+        return 0 if result is None else int(result)
 
     if args.command == "study":
         if args.study_command is None:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
+import yaml
 
 from naturallab.spatial_tracking.calibration.artifacts import (
     CalibrationBundle,
@@ -12,6 +15,7 @@ from naturallab.spatial_tracking.calibration.artifacts import (
     IntrinsicCalibrationArtifact,
 )
 from naturallab.spatial_tracking.calibration.automatic import (
+    AutomaticCalibrationError,
     BoardDetection,
     BoardSpec,
 )
@@ -19,8 +23,61 @@ from naturallab.spatial_tracking.calibration.extrinsics import (
     _resolve_orientations,
     _stereo_calibrate,
     grid_symmetries,
+    load_extrinsics_manifest,
     transform_plane_to_room,
 )
+
+
+def _write_manifest(tmp_path: Path, views: list[dict]) -> Path:
+    path = tmp_path / "shared-board.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": "1.0",
+                "kind": "shared_board_extrinsics_input",
+                "rig_id": "test-room",
+                "anchor_view_id": "camera-02",
+                "room_coordinate_frame": "rig/test-room/floor",
+                "room_frame_mode": "floor_aligned_anchor",
+                "board": {
+                    "internal_columns": 7,
+                    "internal_rows": 7,
+                    "square_size_mm": 30.0,
+                },
+                "sampling": {
+                    "sample_seconds": 1.0,
+                    "stationary_motion_pixels": 20.0,
+                    "minimum_stationary_samples": 2,
+                    "minimum_placement_separation_pixels": 50.0,
+                    "minimum_shared_placements": 3,
+                    "maximum_shared_placements": 12,
+                    "time_tolerance_seconds": 0.15,
+                },
+                "views": views,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _view_files(tmp_path: Path, name: str, first_timestamp: float) -> dict:
+    video = tmp_path / f"{name}.mp4"
+    bundle = tmp_path / f"{name}-bundle.yaml"
+    timestamps = tmp_path / f"{name}_timestamps.csv"
+    video.touch()
+    bundle.touch()
+    timestamps.write_text(
+        f"frame_index,timestamp,timestamp_domain\n0,{first_timestamp},lsl\n",
+        encoding="utf-8",
+    )
+    return {
+        "view_id": name,
+        "video": video.name,
+        "calibration_bundle": bundle.name,
+        "timestamp_csv": timestamps.name,
+    }
 
 
 def _bundle(camera_id: str) -> CalibrationBundle:
@@ -96,6 +153,40 @@ def test_square_grid_has_eight_unique_symmetries() -> None:
         sorted(symmetry.indices) == list(range(board.corner_count))
         for symmetry in symmetries
     )
+
+
+def test_manifest_derives_xdf_video_offsets_from_timestamp_sidecars(
+    tmp_path: Path,
+) -> None:
+    views = [
+        _view_files(tmp_path, "camera-01", 43120.530),
+        _view_files(tmp_path, "camera-02", 43120.400),
+        _view_files(tmp_path, "camera-03", 43120.350),
+    ]
+
+    manifest = load_extrinsics_manifest(_write_manifest(tmp_path, views))
+    offsets = {
+        view.view_id: view.time_offset_seconds
+        for view in manifest.views
+    }
+
+    assert offsets == pytest.approx(
+        {"camera-01": 0.130, "camera-02": 0.0, "camera-03": -0.050}
+    )
+
+
+def test_manifest_rejects_partial_timestamp_sidecars(tmp_path: Path) -> None:
+    first = _view_files(tmp_path, "camera-01", 1.0)
+    second = _view_files(tmp_path, "camera-02", 1.1)
+    second.pop("timestamp_csv")
+
+    with pytest.raises(
+        AutomaticCalibrationError,
+        match="timestamp_csv must be supplied for every view",
+    ):
+        load_extrinsics_manifest(
+            _write_manifest(tmp_path, [first, second])
+        )
 
 
 def test_joint_homography_recovers_per_placement_corner_flips() -> None:

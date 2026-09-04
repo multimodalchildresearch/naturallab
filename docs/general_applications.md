@@ -90,15 +90,15 @@ python scripts/track_people_in_video.py \
 
 ## Custom Object Detection
 
-Classify detected object proposals against reference-image prototypes without
-task-specific model training. Evaluate the resulting categories and thresholds
-on held-out footage from the intended study.
+Start with photographs of the actual objects rather than a new training run.
+NaturalLab groups those photographs by folder name and applies the resulting
+reference-image prototypes to videos or still images.
 
 ### Quick Start
 
 ```bash
 # Step 1: Organize reference images by category
-# reference_images/
+# private-study-data/reference_images/
 #   product_A/
 #     image1.jpg
 #     image2.jpg
@@ -108,28 +108,20 @@ on held-out footage from the intended study.
 
 # Step 2: Create prototypes
 python scripts/detect_custom_objects.py create-prototypes \
-    --images reference_images/ \
-    --output prototypes.h5
+    --images private-study-data/reference_images/ \
+    --output private-study-data/prototypes.h5
 
 # Step 3: Detect in video/images
 python scripts/detect_custom_objects.py detect \
-    --input video.mp4 \
-    --prototypes prototypes.h5 \
-    --output detections/
+    --input private-study-data/video.mp4 \
+    --prototypes private-study-data/prototypes.h5 \
+    --output private-study-data/detection-run-01/ \
+    --save-frames
 ```
 
-### How It Works
-
-1. **First Stage**: OWLv2 detects general object regions
-2. **Second Stage**: CLIP matches detections to your prototypes
-3. **Output**: Category labels with confidence scores
-
-### Tips for Good Prototypes
-
-- **Multiple angles**: 3-5 images per object from different viewpoints
-- **Consistent lighting**: Match expected deployment conditions
-- **Clear backgrounds**: Avoid cluttered prototype images
-- **Size variation**: Include close-up and distant views
+Use several clear views of each object and test them on a separate recording.
+The [object detector setup guide](object_detection_guide.md) gives the full
+photograph, tuning, visual-review, and external-training workflow.
 
 ---
 

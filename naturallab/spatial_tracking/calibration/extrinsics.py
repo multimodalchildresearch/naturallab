@@ -12,7 +12,8 @@ homography before estimating fixed-intrinsic stereo transforms.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import csv
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -59,6 +60,7 @@ _VIEW_FIELDS = {
     "video",
     "calibration_bundle",
     "time_offset_seconds",
+    "timestamp_csv",
 }
 _BOARD_FIELDS = {
     "internal_columns",
@@ -181,6 +183,36 @@ def _resolve_path(value: Any, *, base: Path, field_name: str) -> Path:
     return result
 
 
+def _first_timestamp(path: Path, field_name: str) -> float:
+    """Read the first finite timestamp from an XDF video sidecar."""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None or "timestamp" not in reader.fieldnames:
+                raise AutomaticCalibrationError(
+                    f"{field_name} must contain a 'timestamp' column"
+                )
+            first_row = next(reader, None)
+    except OSError as exc:
+        raise AutomaticCalibrationError(
+            f"could not read {field_name}: {exc}"
+        ) from exc
+    if first_row is None:
+        raise AutomaticCalibrationError(f"{field_name} contains no data rows")
+    raw_timestamp = first_row.get("timestamp")
+    try:
+        timestamp = float(raw_timestamp)
+    except (TypeError, ValueError) as exc:
+        raise AutomaticCalibrationError(
+            f"{field_name}.timestamp must be a finite number"
+        ) from exc
+    if not math.isfinite(timestamp):
+        raise AutomaticCalibrationError(
+            f"{field_name}.timestamp must be a finite number"
+        )
+    return timestamp
+
+
 @dataclass(frozen=True)
 class ExtrinsicViewInput:
     """One fixed view and the calibration/video evidence bound to it."""
@@ -189,6 +221,7 @@ class ExtrinsicViewInput:
     video_path: Path
     bundle_path: Path
     time_offset_seconds: float
+    timestamp_csv_path: Optional[Path] = None
 
 
 @dataclass(frozen=True)
@@ -393,8 +426,16 @@ def load_extrinsics_manifest(
             view_values,
             field_name=f"views[{index}]",
             allowed=_VIEW_FIELDS,
-            required=_VIEW_FIELDS - {"time_offset_seconds"},
+            required={"view_id", "video", "calibration_bundle"},
         )
+        if (
+            "time_offset_seconds" in view_values
+            and "timestamp_csv" in view_values
+        ):
+            raise AutomaticCalibrationError(
+                f"views[{index}] must use either time_offset_seconds or "
+                "timestamp_csv, not both"
+            )
         views.append(
             ExtrinsicViewInput(
                 view_id=_identifier(
@@ -415,6 +456,15 @@ def load_extrinsics_manifest(
                     view_values.get("time_offset_seconds", 0.0),
                     f"views[{index}].time_offset_seconds",
                 ),
+                timestamp_csv_path=(
+                    _resolve_path(
+                        view_values["timestamp_csv"],
+                        base=source.parent,
+                        field_name=f"views[{index}].timestamp_csv",
+                    )
+                    if "timestamp_csv" in view_values
+                    else None
+                ),
             )
         )
     view_ids = [view.view_id for view in views]
@@ -428,6 +478,32 @@ def load_extrinsics_manifest(
         raise AutomaticCalibrationError(
             f"anchor_view_id {anchor_view_id!r} is not present in views"
         )
+
+    timestamp_views = [
+        view for view in views if view.timestamp_csv_path is not None
+    ]
+    if timestamp_views and len(timestamp_views) != len(views):
+        raise AutomaticCalibrationError(
+            "timestamp_csv must be supplied for every view or for no views"
+        )
+    if timestamp_views:
+        first_timestamps = {
+            view.view_id: _first_timestamp(
+                view.timestamp_csv_path,
+                f"views[{index}].timestamp_csv",
+            )
+            for index, view in enumerate(views)
+        }
+        anchor_timestamp = first_timestamps[anchor_view_id]
+        views = [
+            replace(
+                view,
+                time_offset_seconds=(
+                    first_timestamps[view.view_id] - anchor_timestamp
+                ),
+            )
+            for view in views
+        ]
 
     room_frame_mode = _string(values["room_frame_mode"], "room_frame_mode")
     if room_frame_mode not in {"anchor_opencv", "floor_aligned_anchor"}:
@@ -1784,6 +1860,16 @@ def calibrate_extrinsics_from_manifest(
                     view.view_id
                 ].input_rotation.value,
                 "time_offset_seconds": view.time_offset_seconds,
+                "time_offset_source": (
+                    "xdf_timestamp_csv_first_sample"
+                    if view.timestamp_csv_path is not None
+                    else "manifest_or_default"
+                ),
+                "timestamp_csv": (
+                    source_identity(view.timestamp_csv_path)
+                    if view.timestamp_csv_path is not None
+                    else None
+                ),
                 "sampling": metadata[view.view_id].to_dict(),
                 "transform_to_room": room_from_camera[
                     view.view_id

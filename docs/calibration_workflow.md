@@ -230,12 +230,22 @@ sampling:
   time_tolerance_seconds: 0.15
 views:
   - view_id: camera-01
-    video: recordings/camera-01-floor.mp4
+    video: extracted/shared-board/camera-01.mp4
     calibration_bundle: calibration/camera-01/floor/calibration-bundle.yaml
+    timestamp_csv: extracted/shared-board/camera-01_timestamps.csv
   - view_id: camera-03
-    video: recordings/camera-03-floor.mp4
+    video: extracted/shared-board/camera-03.mp4
     calibration_bundle: calibration/camera-03/floor/calibration-bundle.yaml
+    timestamp_csv: extracted/shared-board/camera-03_timestamps.csv
 ```
+
+For videos extracted from one XDF, supply the matching timestamp CSV generated
+by the extractor for every view. The loader subtracts the anchor view's first
+timestamp from each view's first timestamp and uses that relative start offset.
+Do not trim or re-encode the MP4s after extraction. For externally produced
+videos, omit `timestamp_csv` and set `time_offset_seconds` explicitly for every
+view; an omitted offset defaults to zero and is valid only when video starts are
+already aligned within `time_tolerance_seconds`.
 
 Then run:
 

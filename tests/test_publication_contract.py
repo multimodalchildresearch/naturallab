@@ -14,6 +14,7 @@ REQUIRED_PUBLIC_FILES = (
     "LICENSE",
     "docs/quickstart.md",
     "docs/lab_setup_guide.md",
+    "docs/object_detection_guide.md",
     "docs/calibration_workflow.md",
     "docs/multiview_3d_readiness.md",
     "docs/researcher_workflow.md",

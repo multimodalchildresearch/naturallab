@@ -355,8 +355,8 @@ def stream_neon_api_to_lsl(device, device_id="Device1"):
         print(f"Neon API streaming stopped for {device_id}")
 
 #========================= Eye Events to LSL (Child Only) =========================#
-def stream_eye_events_to_lsl():
-    """Stream child-device fixations and saccades through the Neon API."""
+def stream_eye_events_to_lsl(child_ip):
+    """Stream fixations and saccades from the configured child Neon."""
     if not REALTIME_API_AVAILABLE:
         print("Pupil Labs Realtime API is not available. Skipping eye events streaming.")
         return
@@ -366,7 +366,7 @@ def stream_eye_events_to_lsl():
     # Import required modules from Pupil Labs Realtime API
     try:
         import asyncio
-        from pupil_labs.realtime_api import Device, Network, receive_eye_events_data
+        from pupil_labs.realtime_api import Device, receive_eye_events_data
         from pupil_labs.realtime_api.streaming.eye_events import FixationEventData
     except ImportError:
         print("Error importing required modules for eye events streaming.")
@@ -426,17 +426,8 @@ def stream_eye_events_to_lsl():
     async def process_eye_events():
         nonlocal fixation_id, saccade_id
         
-        print("Connecting to Neon device for eye events...")
-        async with Network() as network:
-            dev_info = await network.wait_for_new_device(timeout_seconds=5)
-            
-            if dev_info is None:
-                print("No device could be found! Aborting eye events streaming.")
-                return
-                
-            print(f"Found device for eye events: {dev_info.name}")
-            
-            async with Device.from_discovered_device(dev_info) as device:
+        print(f"Connecting to configured Child device at {child_ip} for eye events...")
+        async with Device(child_ip, 8080) as device:
                 status = await device.get_status()
                 sensor_eye_events = status.direct_eye_events_sensor()
                 
@@ -892,7 +883,23 @@ def main():
     parser.add_argument("--no-realsense", action="store_true", help="Disable RealSense streaming")
     parser.add_argument("--no-neon", action="store_true", help="Disable Neon streaming")
     parser.add_argument("--no-audio", action="store_true", help="Disable audio streaming")
-    parser.add_argument("--no-eye-events", action="store_true", help="Disable eye events (fixations/saccades) streaming")
+    eye_event_group = parser.add_mutually_exclusive_group()
+    eye_event_group.add_argument(
+        "--eye-events",
+        dest="no_eye_events",
+        action="store_false",
+        help=(
+            "Enable fixation/saccade streaming only after validating the "
+            "selected device role"
+        ),
+    )
+    eye_event_group.add_argument(
+        "--no-eye-events",
+        dest="no_eye_events",
+        action="store_true",
+        help="Disable fixation/saccade streaming (default)",
+    )
+    parser.set_defaults(no_eye_events=True)
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
     parser.add_argument("--audio-method", type=str, choices=["pyav", "vlc"], default="pyav", 
                        help="Method to use for audio streaming (default: pyav)")
@@ -908,6 +915,8 @@ def main():
         parser.error(
             "pylsl is required; install the NaturalLab acquisition extra"
         )
+    if not args.no_neon and not args.no_eye_events and not args.child_ip:
+        parser.error("--eye-events requires an explicit --child-ip")
     
     # Store threads
     threads = []
@@ -920,10 +929,14 @@ def main():
         threads.append(realsense_thread)
     
     # Start eye events streaming FIRST (before other Neon streams) - Child only
-    if not args.no_eye_events and REALTIME_API_AVAILABLE:
+    if (
+        not args.no_neon
+        and not args.no_eye_events
+        and REALTIME_API_AVAILABLE
+    ):
         try:
             print("Starting eye events streaming for Child device...")
-            eye_events_thread = stream_eye_events_to_lsl()
+            eye_events_thread = stream_eye_events_to_lsl(args.child_ip)
             if eye_events_thread:
                 threads.append(eye_events_thread)
                 print("✓ Eye events streaming started successfully")
@@ -1066,22 +1079,32 @@ def main():
                 rtsp_thread.daemon = True
                 rtsp_thread.start()
                 threads.append(rtsp_thread)
+
+    if not threads:
+        print(
+            "Error: no acquisition source started. Enable at least one "
+            "available camera, Neon device, or RealSense device.",
+            file=sys.stderr,
+        )
+        return 1
     
     # Print instructions
-    print("\n=== LSL Streams Created (Multi-Device with Eye Events) ===")
+    print("\n=== NaturalLab LSL streams started ===")
     print("1. Open LabRecorder")
     print("2. Click 'Update' to see all streams")
     print("3. Select the streams you want to record")
     print("4. Click 'Start' to begin recording to XDF")
-    print("\nStreams are named by role:")
-    print("  - NeonGaze_Caregiver, NeonGaze_Child")
-    print("  - NeonVideo_Caregiver, NeonVideo_Child")
-    print("  - NeonIMU_Caregiver, NeonIMU_Child")
-    print("  - NeonFixations_Child (child only)")
-    print("  - NeonSaccades_Child (child only)")
-    print("  - NeonAudio_Caregiver, NeonAudio_Child")
-    print("\nRecommended usage:")
-    print("  python lsl_streams.py --caregiver-ip X.X.X.X --child-ip Y.Y.Y.Y")
+    if not args.no_neon:
+        print("\nNeon streams are named by role:")
+        print("  - NeonGaze_Caregiver, NeonGaze_Child")
+        print("  - NeonVideo_Caregiver, NeonVideo_Child")
+        if not args.no_imu:
+            print("  - NeonIMU_Caregiver, NeonIMU_Child")
+        if not args.no_eye_events:
+            print("  - NeonFixations_Child (validate device role before use)")
+            print("  - NeonSaccades_Child (validate device role before use)")
+        if not args.no_audio:
+            print("  - NeonAudio_Caregiver, NeonAudio_Child")
     print("\nRunning... Press Ctrl+C to stop")
     
     try:
@@ -1095,9 +1118,10 @@ def main():
     # Wait for all threads to finish
     for thread in threads:
         thread.join(timeout=2)
-    
+
     print("All streams stopped")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

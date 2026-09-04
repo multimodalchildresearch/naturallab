@@ -21,6 +21,7 @@ Features:
 import os
 import json
 import subprocess
+import sys
 import threading
 import time
 import signal
@@ -49,6 +50,7 @@ _UNCONFIGURED_ADDRESSES = frozenset({"", "YOUR_IP_ADDRESS"})
 _TK_NORMAL = "normal"
 _TK_DISABLED = "disabled"
 _RTSP_URL_PATTERN = re.compile(r"rtsp://[^\s,]+", flags=re.IGNORECASE)
+_BUNDLED_LSL_SCRIPT = str(Path(__file__).with_name("lsl_streams.py"))
 
 
 def _require_tk():
@@ -206,7 +208,7 @@ class RecordingGUI:
     def __init__(self, root):
         _require_tk()
         self.root = root
-        self.root.title("Eye Tracking Recording Setup - Multi-Device")
+        self.root.title("NaturalLab Recorder")
         self.root.geometry("1100x750")
         
         # Configuration file
@@ -243,13 +245,18 @@ class RecordingGUI:
     def load_config(self):
         """Load configuration from file"""
         default_config = {
-            "lsl_script_path": "",
+            "lsl_script_path": _BUNDLED_LSL_SCRIPT,
             "conda_env_name": "",
             "extraction_drive": "/media",
             "labrecorder_path": "/usr/local/bin/LabRecorder",
             "labrecorder_config": "",
-            "caregiver_ip": "YOUR_IP_ADDRESS",
-            "child_ip": "YOUR_IP_ADDRESS",
+            "caregiver_ip": "",
+            "child_ip": "",
+            "no_neon": False,
+            "no_realsense": False,
+            "no_audio": False,
+            "no_imu": False,
+            "no_eye_events": True,
             "last_recording_dir": os.path.expanduser("~/recordings"),
             "auto_extract": True,
             "delete_after_extract": False,
@@ -259,18 +266,18 @@ class RecordingGUI:
             # Individual camera settings
             "rtsp_user": "admin",
             "rtsp_stream": "stream1",
-            "cam1_ip": "YOUR_IP_ADDRESS",
+            "cam1_ip": "",
             "cam1_name": "Camera1",
-            "cam1_enabled": True,
-            "cam2_ip": "YOUR_IP_ADDRESS",
+            "cam1_enabled": False,
+            "cam2_ip": "",
             "cam2_name": "Camera2",
-            "cam2_enabled": True,
-            "cam3_ip": "YOUR_IP_ADDRESS",
+            "cam2_enabled": False,
+            "cam3_ip": "",
             "cam3_name": "Camera3",
-            "cam3_enabled": True,
-            "cam4_ip": "YOUR_IP_ADDRESS",
+            "cam3_enabled": False,
+            "cam4_ip": "",
             "cam4_name": "Camera4",
-            "cam4_enabled": True
+            "cam4_enabled": False,
         }
         
         try:
@@ -282,6 +289,8 @@ class RecordingGUI:
                 for key, value in default_config.items():
                     if key not in config:
                         config[key] = value
+                if not str(config.get("lsl_script_path", "")).strip():
+                    config["lsl_script_path"] = _BUNDLED_LSL_SCRIPT
                 if removed_keys:
                     try:
                         _write_private_json(self.config_file, config)
@@ -413,7 +422,7 @@ class RecordingGUI:
         ttk.Label(caregiver_frame, text="Caregiver IP:", width=15).pack(side=tk.LEFT)
         self.caregiver_ip_var = tk.StringVar()
         ttk.Entry(caregiver_frame, textvariable=self.caregiver_ip_var, width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Label(caregiver_frame, text="(e.g., YOUR_IP_ADDRESS)", foreground="gray").pack(side=tk.LEFT, padx=5)
+        ttk.Label(caregiver_frame, text="(e.g., 192.168.1.120)", foreground="gray").pack(side=tk.LEFT, padx=5)
         
         # Child IP
         child_frame = ttk.Frame(device_frame)
@@ -421,7 +430,7 @@ class RecordingGUI:
         ttk.Label(child_frame, text="Child IP:", width=15).pack(side=tk.LEFT)
         self.child_ip_var = tk.StringVar()
         ttk.Entry(child_frame, textvariable=self.child_ip_var, width=20).pack(side=tk.LEFT, padx=5)
-        ttk.Label(child_frame, text="(e.g., YOUR_IP_ADDRESS)", foreground="gray").pack(side=tk.LEFT, padx=5)
+        ttk.Label(child_frame, text="(e.g., 192.168.1.121)", foreground="gray").pack(side=tk.LEFT, padx=5)
         
         # Max devices
         max_devices_frame = ttk.Frame(device_frame)
@@ -448,10 +457,10 @@ class RecordingGUI:
         
         # Default camera settings from LSL script
         camera_defaults = [
-            {"ip": "YOUR_IP_ADDRESS", "name": "Camera1"},
-            {"ip": "YOUR_IP_ADDRESS", "name": "Camera2"},
-            {"ip": "YOUR_IP_ADDRESS", "name": "Camera3"},
-            {"ip": "YOUR_IP_ADDRESS", "name": "Camera4"}
+            {"ip": "", "name": "Camera1"},
+            {"ip": "", "name": "Camera2"},
+            {"ip": "", "name": "Camera3"},
+            {"ip": "", "name": "Camera4"},
         ]
         
         # Create fields for each camera
@@ -471,7 +480,7 @@ class RecordingGUI:
             ttk.Entry(cam_frame, textvariable=name_var, width=25).grid(row=0, column=2, padx=5)
             
             # Enable checkbox
-            enable_var = tk.BooleanVar(value=True)
+            enable_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(cam_frame, variable=enable_var).grid(row=0, column=3, padx=5)
             
             # Store variables
@@ -512,6 +521,10 @@ class RecordingGUI:
         
         options_row1 = ttk.Frame(options_frame)
         options_row1.pack(fill=tk.X, pady=2)
+
+        self.no_neon_var = tk.BooleanVar()
+        ttk.Checkbutton(options_row1, text="Disable Neon",
+                       variable=self.no_neon_var).pack(side=tk.LEFT, padx=5)
         
         self.no_realsense_var = tk.BooleanVar()
         ttk.Checkbutton(options_row1, text="Disable RealSense", 
@@ -528,7 +541,7 @@ class RecordingGUI:
         ttk.Checkbutton(options_row2, text="Disable IMU", 
                        variable=self.no_imu_var).pack(side=tk.LEFT, padx=5)
         
-        self.no_eye_events_var = tk.BooleanVar()
+        self.no_eye_events_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(options_row2, text="Disable Eye Events", 
                        variable=self.no_eye_events_var).pack(side=tk.LEFT, padx=5)
         
@@ -536,17 +549,15 @@ class RecordingGUI:
         preview_frame = ttk.LabelFrame(main_frame, text="Expected LSL Streams", padding=10)
         preview_frame.pack(fill=tk.X, padx=5, pady=5)
         
-        preview_text = """With 2 Neon devices, you'll get these streams:
-• NeonGaze_Caregiver, NeonGaze_Child (gaze data)
-• NeonVideo_Caregiver, NeonVideo_Child (scene camera video)
-• NeonIMU_Caregiver, NeonIMU_Child (motion data)
-• NeonFixations_Child (fixation events - child only)
-• NeonSaccades_Child (saccade events - child only)
-• NeonAudio_Caregiver, NeonAudio_Child (audio from both)
-• RealSense_Color, RealSense_Depth (if enabled)
-• Camera streams (if configured)
+        preview_text = """Possible streams from the devices you enable:
+• Room cameras: the display names entered above
+• Neon: NeonVideo_<role> and NeonGaze_<role>
+• Neon audio and motion: NeonAudio_<role> and NeonIMU_<role>
+• RealSense: RealSense_Color, RealSense_Depth, RealSense_Metadata
 
-Note: Eye events (fixations/saccades) only work for Child device due to API limitations."""
+Only connected and enabled devices will appear in LabRecorder. Eye-event
+streaming is disabled by default because its device role must be validated for
+the exact lab configuration before use."""
         
         ttk.Label(preview_frame, text=preview_text, foreground="blue").pack(anchor=tk.W)
     
@@ -755,9 +766,17 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
         recordings_dir = self.recording_dir_var.get() or "./recordings"
         required_streams = []
         configured_roles = []
-        if self.caregiver_ip_var.get().strip() not in _UNCONFIGURED_ADDRESSES:
+        if (
+            not self.no_neon_var.get()
+            and self.caregiver_ip_var.get().strip()
+            not in _UNCONFIGURED_ADDRESSES
+        ):
             configured_roles.append("Caregiver")
-        if self.child_ip_var.get().strip() not in _UNCONFIGURED_ADDRESSES:
+        if (
+            not self.no_neon_var.get()
+            and self.child_ip_var.get().strip()
+            not in _UNCONFIGURED_ADDRESSES
+        ):
             configured_roles.append("Child")
 
         for role in configured_roles:
@@ -818,7 +837,7 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
                 name = self.camera_vars[cam_key]["name"].get().strip()
                 enabled = self.camera_vars[cam_key]["enabled"].get()
                 
-                if ip and name:
+                if ip not in _UNCONFIGURED_ADDRESSES and name:
                     try:
                         rtsp_url = build_rtsp_url(ip, stream, user, password)
                     except ValueError as error:
@@ -932,6 +951,13 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
         self.delete_after_extract_var.set(self.config.get("delete_after_extract", False))
         self.depth_interval_var.set(self.config.get("depth_interval", 30))
         self.keep_raw_depth_var.set(self.config.get("keep_raw_depth", True))
+        self.no_neon_var.set(self.config.get("no_neon", False))
+        self.no_realsense_var.set(self.config.get("no_realsense", False))
+        self.no_audio_var.set(self.config.get("no_audio", False))
+        self.no_imu_var.set(self.config.get("no_imu", False))
+        self.no_eye_events_var.set(
+            self.config.get("no_eye_events", True)
+        )
         
         # Load camera settings
         self.rtsp_user_var.set(self.config.get("rtsp_user", "admin"))
@@ -944,7 +970,9 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
             if cam_key in self.camera_vars:
                 self.camera_vars[cam_key]["ip"].set(self.config.get(f"cam{i}_ip", ""))
                 self.camera_vars[cam_key]["name"].set(self.config.get(f"cam{i}_name", ""))
-                self.camera_vars[cam_key]["enabled"].set(self.config.get(f"cam{i}_enabled", True))
+                self.camera_vars[cam_key]["enabled"].set(
+                    self.config.get(f"cam{i}_enabled", False)
+                )
     
     def save_current_config(self):
         """Save current GUI settings to config"""
@@ -961,6 +989,11 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
         self.config["delete_after_extract"] = self.delete_after_extract_var.get()
         self.config["depth_interval"] = self.depth_interval_var.get()
         self.config["keep_raw_depth"] = self.keep_raw_depth_var.get()
+        self.config["no_neon"] = self.no_neon_var.get()
+        self.config["no_realsense"] = self.no_realsense_var.get()
+        self.config["no_audio"] = self.no_audio_var.get()
+        self.config["no_imu"] = self.no_imu_var.get()
+        self.config["no_eye_events"] = self.no_eye_events_var.get()
         
         # Save non-secret camera settings. Passwords are deliberately session-only.
         self.config["rtsp_user"] = self.rtsp_user_var.get()
@@ -1003,10 +1036,23 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
             return
         
         conda_env = self.conda_env_var.get()
-        caregiver_ip = self.caregiver_ip_var.get()
-        child_ip = self.child_ip_var.get()
-        
-        if not caregiver_ip and not child_ip:
+        caregiver_ip = self.caregiver_ip_var.get().strip()
+        child_ip = self.child_ip_var.get().strip()
+        if caregiver_ip in _UNCONFIGURED_ADDRESSES:
+            caregiver_ip = ""
+        if child_ip in _UNCONFIGURED_ADDRESSES:
+            child_ip = ""
+        no_neon = self.no_neon_var.get()
+
+        if not no_neon and not self.no_eye_events_var.get() and not child_ip:
+            messagebox.showerror(
+                "Child Neon IP required",
+                "Eye-event streaming requires an explicit Child Neon IP. "
+                "Enter the Child IP or select Disable Eye Events.",
+            )
+            return
+
+        if not no_neon and not caregiver_ip and not child_ip:
             if not messagebox.askyesno("No Device IPs", "No device IPs specified. Continue with auto-discovery?"):
                 return
         
@@ -1015,7 +1061,7 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
             if conda_env:
                 cmd = ["conda", "run", "-n", conda_env, "python", script_path]
             else:
-                cmd = ["python3", script_path]
+                cmd = [sys.executable, script_path]
             
             # Add multi-device arguments
             if caregiver_ip:
@@ -1039,7 +1085,7 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
                     ip = self.camera_vars[cam_key]["ip"].get().strip()
                     name = self.camera_vars[cam_key]["name"].get().strip()
                     
-                    if ip and name:
+                    if ip not in _UNCONFIGURED_ADDRESSES and name:
                         rtsp_url = build_rtsp_url(ip, stream, user, password)
                         rtsp_urls.append(rtsp_url)
                         camera_names.append(name)
@@ -1053,6 +1099,8 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
                 self.log("No cameras enabled")
             
             # Add optional flags
+            if no_neon:
+                cmd.append("--no-neon")
             if self.no_realsense_var.get():
                 cmd.append("--no-realsense")
             if self.no_audio_var.get():
@@ -1061,6 +1109,8 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
                 cmd.append("--no-imu")
             if self.no_eye_events_var.get():
                 cmd.append("--no-eye-events")
+            else:
+                cmd.append("--eye-events")
             
             safe_command = redact_command(cmd)
             self.log(f"Starting multi-device LSL streaming: {' '.join(safe_command)}")
@@ -1150,15 +1200,41 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
     
     def read_lsl_output(self):
         """Read output from LSL process"""
+        process = self.lsl_process
         try:
-            while self.streaming_active and self.lsl_process:
-                line = self.lsl_process.stdout.readline()
+            while (
+                process is not None
+                and self.streaming_active
+                and self.lsl_process is process
+            ):
+                line = process.stdout.readline()
                 if line:
                     self.log(f"LSL: {redact_log_text(line.strip())}")
-                elif self.lsl_process.poll() is not None:
+                elif process.poll() is not None:
                     break
         except Exception as e:
             self.log(f"Error reading LSL output: {e}")
+        finally:
+            if (
+                process is not None
+                and process is self.lsl_process
+                and process.poll() is not None
+            ):
+                self.streaming_active = False
+                self.log(
+                    "LSL streaming process stopped with exit code "
+                    f"{process.returncode}"
+                )
+                try:
+                    self.root.after(
+                        0,
+                        lambda: (
+                            self.start_lsl_btn.config(state=_TK_NORMAL),
+                            self.stop_lsl_btn.config(state=_TK_DISABLED),
+                        ),
+                    )
+                except Exception:
+                    pass
     
     def start_labrecorder(self):
         """Start LabRecorder with config file support"""
@@ -1232,14 +1308,39 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
         # Start LSL streaming
         if not self.streaming_active:
             self.start_lsl_streaming()
+            if not self.streaming_active:
+                self.log("Quick setup stopped because LSL streaming did not start")
+                return
             time.sleep(3)  # Give LSL time to start multiple devices
+            if (
+                not self.streaming_active
+                or self.lsl_process is None
+                or self.lsl_process.poll() is not None
+            ):
+                self.streaming_active = False
+                self.log(
+                    "Quick setup stopped because the LSL streaming process "
+                    "exited during startup"
+                )
+                return
         
         # Start LabRecorder
         if not self.labrecorder_process:
             self.start_labrecorder()
+            if not self.labrecorder_process:
+                self.log("Quick setup stopped because LabRecorder did not start")
+                return
         
         self.log("Multi-device quick setup completed")
-        messagebox.showinfo("Quick Setup", "Both multi-device LSL streaming and LabRecorder have been started.\n\nNext steps:\n1. In LabRecorder, click 'Update' to see all streams\n2. Select streams for both Caregiver and Child\n3. Click 'Start' to begin recording\n\nLook for streams ending with '_Caregiver' and '_Child'\n\nNote: Eye events (fixations/saccades) only available from Child device.")
+        messagebox.showinfo(
+            "Quick Setup",
+            "The selected streams and LabRecorder have been started.\n\n"
+            "Next steps:\n"
+            "1. In LabRecorder, click 'Update'.\n"
+            "2. Confirm that every intended stream appears once and its "
+            "counter advances.\n"
+            "3. Select those streams and click 'Start'.",
+        )
     
     def emergency_stop(self):
         """Emergency stop - stop everything"""
@@ -1450,7 +1551,7 @@ Note: Eye events (fixations/saccades) only work for Child device due to API limi
             if conda_env:
                 cmd = ["conda", "run", "-n", conda_env, "python", extract_script]
             else:
-                cmd = ["python3", extract_script]
+                cmd = [sys.executable, extract_script]
             
             cmd.extend(["--file", filepath, "--outdir", output_dir])
             

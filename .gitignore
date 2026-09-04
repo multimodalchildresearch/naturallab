@@ -27,6 +27,7 @@ logs/
 /extracted/
 /extracted_data/
 /recordings/
+/private-study-data/
 
 # Data files
 *.mp4
