@@ -1524,15 +1524,17 @@ the exact lab configuration before use."""
             
             # Determine output directory
             extraction_drive = self.extraction_drive_var.get()
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            basename = os.path.splitext(os.path.basename(filepath))[0]
             if extraction_drive and os.path.exists(extraction_drive):
                 # Create timestamped directory on extraction drive
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                basename = os.path.splitext(os.path.basename(filepath))[0]
                 output_dir = os.path.join(extraction_drive, f"{basename}_{timestamp}")
             else:
-                # Use same directory as XDF file
-                output_dir = os.path.join(os.path.dirname(filepath), 
-                                         os.path.splitext(os.path.basename(filepath))[0] + "_extracted")
+                # Keep each extraction isolated from previous results.
+                output_dir = os.path.join(
+                    os.path.dirname(filepath),
+                    f"{basename}_extracted_{timestamp}",
+                )
             
             self.log(f"Extracting {filepath} to {output_dir}")
             

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -10,12 +11,21 @@ from naturallab.spatial_tracking.calibration import (
     IntrinsicCalibrationArtifact,
 )
 from scripts.track_people_in_video import (
+    STATISTICS_OUTPUT_COLUMNS,
+    TRACK_OUTPUT_COLUMNS,
     add_distance_statistics,
     build_argument_parser,
+    build_video_output_plan,
     discover_video_files,
+    expected_decoded_frame_count,
     load_floor_tracker,
+    main,
+    prepare_video_output,
+    probe_video,
     select_track_evidence_rows,
     summarize_track_records,
+    validate_video_output_plan,
+    write_track_tables,
 )
 
 
@@ -336,6 +346,301 @@ def test_video_directory_discovery_is_case_insensitive_and_natural(
         "session2.mkv",
         "session10.MP4",
     ]
+
+
+def test_explicit_non_video_file_is_not_accepted_as_video(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "notes.txt"
+    input_path.write_text("not a video", encoding="utf-8")
+
+    assert discover_video_files(input_path) == []
+
+
+def test_same_stem_inputs_fail_instead_of_sharing_results(
+    tmp_path: Path,
+) -> None:
+    videos = [tmp_path / "session.mp4", tmp_path / "session.mov"]
+
+    with pytest.raises(ValueError, match="same output directory"):
+        build_video_output_plan(videos, tmp_path / "results")
+
+
+def test_existing_results_fail_closed_and_overwrite_removes_all_stale_files(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "session.mp4"
+    destination = tmp_path / "results" / "session"
+    frames = destination / "frames"
+    frames.mkdir(parents=True)
+    (destination / "tracks.csv").write_text("old", encoding="utf-8")
+    (destination / "identity_matches.json").write_text(
+        "old",
+        encoding="utf-8",
+    )
+    (frames / "frame_000000.jpg").write_bytes(b"old")
+    plan = build_video_output_plan([video_path], tmp_path / "results")
+
+    with pytest.raises(FileExistsError, match="--overwrite"):
+        validate_video_output_plan(plan, overwrite=False)
+
+    validate_video_output_plan(plan, overwrite=True)
+    prepare_video_output(destination, overwrite=True)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
+def test_overwrite_never_replaces_a_non_directory_destination(
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "session.mp4"
+    destination = tmp_path / "results" / "session"
+    destination.parent.mkdir()
+    destination.write_text("unrelated file", encoding="utf-8")
+    plan = build_video_output_plan([video_path], tmp_path / "results")
+
+    with pytest.raises(FileExistsError, match="not a directory"):
+        validate_video_output_plan(plan, overwrite=True)
+
+    assert destination.read_text(encoding="utf-8") == "unrelated file"
+
+
+def test_zero_track_run_writes_stable_empty_csv_contracts(
+    tmp_path: Path,
+) -> None:
+    import pandas as pd
+
+    video_output = tmp_path / "session"
+    video_output.mkdir()
+
+    tracks, statistics = write_track_tables(
+        video_output,
+        [],
+        fps=25.0,
+        floor_tracker=None,
+    )
+
+    assert tracks.empty
+    assert statistics.empty
+    assert pd.read_csv(video_output / "tracks.csv").columns.tolist() == list(
+        TRACK_OUTPUT_COLUMNS
+    )
+    assert pd.read_csv(
+        video_output / "track_statistics.csv"
+    ).columns.tolist() == list(STATISTICS_OUTPUT_COLUMNS)
+
+
+def test_empty_input_directory_returns_nonzero_without_creating_output(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    input_path = tmp_path / "input"
+    input_path.mkdir()
+    output_path = tmp_path / "results"
+
+    assert main(["--input", str(input_path), "--output", str(output_path)]) == 1
+    assert "No supported video files found" in capsys.readouterr().out
+    assert not output_path.exists()
+
+
+def test_undecodable_video_returns_nonzero_without_changing_outputs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    input_path = tmp_path / "broken.mp4"
+    input_path.write_bytes(b"not a video container")
+    output_path = tmp_path / "results"
+
+    assert probe_video(input_path) is None
+    assert main(["--input", str(input_path), "--output", str(output_path)]) == 1
+    assert "Could not establish a complete, decodable video contract" in (
+        capsys.readouterr().out
+    )
+    assert not output_path.exists()
+
+
+def test_probe_rejects_unknown_frame_count_even_when_first_frame_decodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cv2
+
+    class UnknownLengthCapture:
+        def __init__(self, _path) -> None:
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def get(self, property_id):
+            if property_id == cv2.CAP_PROP_FRAME_COUNT:
+                return 0.0
+            if property_id == cv2.CAP_PROP_FPS:
+                return 25.0
+            raise AssertionError(f"unexpected property: {property_id}")
+
+        def read(self):
+            return True, np.zeros((16, 16, 3), dtype=np.uint8)
+
+        def release(self):
+            self.released = True
+
+    monkeypatch.setattr(cv2, "VideoCapture", UnknownLengthCapture)
+    input_path = tmp_path / "unknown-length.mp4"
+    input_path.write_bytes(b"test fixture")
+
+    assert probe_video(input_path) is None
+
+
+def test_truncated_video_returns_nonzero_and_discards_partial_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from types import SimpleNamespace
+
+    import naturallab.media
+    import naturallab.spatial_tracking.detection.yolo_detector as yolo_module
+    import scripts.track_people_in_video as tracking_script
+
+    class EmptyDetector:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def process(self, data):
+            return {
+                **data,
+                "detections": [],
+                "detection_metadata": {"skipped": False},
+                "detection_provenance": {"backend": "test-empty"},
+            }
+
+    class TruncatedSource:
+        def __init__(self, path, *, stop_frame=None) -> None:
+            self.path = path
+            self.stop_frame = stop_frame
+
+        def __iter__(self):
+            yield SimpleNamespace(
+                frame_index=0,
+                image=np.zeros((16, 16, 3), dtype=np.uint8),
+                metadata={"timestamp_source": "test"},
+                source_timestamp=0.0,
+                timestamp_ns=0,
+            )
+
+    monkeypatch.setattr(yolo_module, "YOLODetectorModule", EmptyDetector)
+    monkeypatch.setattr(naturallab.media, "VideoFileSource", TruncatedSource)
+    monkeypatch.setattr(
+        tracking_script,
+        "probe_video",
+        lambda _path: (100, 25.0),
+    )
+    input_path = tmp_path / "truncated.mp4"
+    input_path.write_bytes(b"test fixture")
+    output_path = tmp_path / "results"
+
+    result = main(
+        ["--input", str(input_path), "--output", str(output_path)]
+    )
+
+    captured = capsys.readouterr().out
+    assert result == 1
+    assert "decoding ended early after 1 of 100 expected frames" in captured
+    assert "Processing complete!" not in captured
+    assert not (output_path / "truncated").exists()
+
+
+@pytest.mark.parametrize(
+    ("total_frames", "max_frames", "expected"),
+    [
+        (100, None, 100),
+        (100, 20, 20),
+        (10, 20, 10),
+        (0, None, None),
+        (0, 20, None),
+    ],
+)
+def test_expected_decoded_frame_count(
+    total_frames: int,
+    max_frames: int | None,
+    expected: int | None,
+) -> None:
+    assert expected_decoded_frame_count(total_frames, max_frames) == expected
+
+
+def test_valid_zero_detection_run_writes_all_requested_empty_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import pandas as pd
+
+    import naturallab.media
+    import naturallab.spatial_tracking.detection.yolo_detector as yolo_module
+    import scripts.track_people_in_video as tracking_script
+
+    class EmptyDetector:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def process(self, data):
+            return {
+                **data,
+                "detections": [],
+                "detection_metadata": {"skipped": False},
+                "detection_provenance": {"backend": "test-empty"},
+            }
+
+    class TwoFrameSource:
+        def __init__(self, path, *, stop_frame=None) -> None:
+            self.path = path
+            self.stop_frame = stop_frame
+
+        def __iter__(self):
+            frame_count = min(2, self.stop_frame or 2)
+            for frame_index in range(frame_count):
+                yield SimpleNamespace(
+                    frame_index=frame_index,
+                    image=np.zeros((16, 16, 3), dtype=np.uint8),
+                    metadata={"timestamp_source": "test"},
+                    source_timestamp=frame_index / 25,
+                    timestamp_ns=frame_index * 40_000_000,
+                )
+
+    monkeypatch.setattr(yolo_module, "YOLODetectorModule", EmptyDetector)
+    monkeypatch.setattr(naturallab.media, "VideoFileSource", TwoFrameSource)
+    monkeypatch.setattr(
+        tracking_script,
+        "probe_video",
+        lambda path: (2, 25.0),
+    )
+    input_path = tmp_path / "session.mp4"
+    input_path.write_bytes(b"test fixture")
+    output_path = tmp_path / "results"
+
+    result = main(
+        [
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--identities",
+            '{"participant":"the study participant"}',
+        ]
+    )
+
+    video_output = output_path / "session"
+    assert result == 0
+    assert pd.read_csv(video_output / "tracks.csv").empty
+    assert pd.read_csv(video_output / "track_statistics.csv").empty
+    identity_output = json.loads(
+        (video_output / "identity_matches.json").read_text(encoding="utf-8")
+    )
+    assert identity_output["assignments"] == {}
+    assert not (video_output / "frames").exists()
 
 
 def test_identity_evidence_prefers_observed_track_rows() -> None:

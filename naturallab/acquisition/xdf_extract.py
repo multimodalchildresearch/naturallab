@@ -14,6 +14,7 @@ import sys
 import argparse
 import base64
 import json
+import re
 import time
 import numpy as np
 import pandas as pd
@@ -31,6 +32,251 @@ except ImportError as error:
     raise ImportError(
         "tqdm is required; install NaturalLab's core dependencies"
     ) from error
+
+
+def _stream_name(stream):
+    """Return an XDF stream name without exposing pyxdf's list wrapping."""
+    try:
+        return str(stream["info"]["name"][0])
+    except (KeyError, IndexError, TypeError):
+        return "<unknown>"
+
+
+def _stream_type(stream):
+    """Return an XDF stream type without exposing pyxdf's list wrapping."""
+    try:
+        return str(stream["info"]["type"][0])
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _is_declared_imu_stream(stream):
+    """Return whether stream metadata explicitly identifies an IMU stream."""
+    name = _stream_name(stream).lower()
+    return _stream_type(stream).lower() == "imu" or name in {
+        "neonimu",
+        "neon_imu",
+        "imu",
+    }
+
+
+def _safe_filename_component(value):
+    """Make a deterministic, portable filename component."""
+    component = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower())
+    return component.strip("_") or "stream"
+
+
+def _plan_imu_output_filenames(streams):
+    """Choose non-colliding IMU filenames while retaining single-stream output."""
+    if len(streams) == 1:
+        return ["imu.csv"]
+
+    filenames = []
+    occurrences = {}
+    for stream in streams:
+        stem = f"imu_{_safe_filename_component(_stream_name(stream))}"
+        occurrences[stem] = occurrences.get(stem, 0) + 1
+        occurrence = occurrences[stem]
+        suffix = "" if occurrence == 1 else f"_{occurrence}"
+        filenames.append(f"{stem}{suffix}.csv")
+    return filenames
+
+
+def _prepare_extraction_output_dir(output_dir):
+    """Create an empty output directory or reject stale/reused results."""
+    output_dir = os.path.abspath(os.fspath(output_dir))
+    if os.path.lexists(output_dir):
+        if os.path.islink(output_dir) or not os.path.isdir(output_dir):
+            raise RuntimeError(
+                f"XDF output path is not a normal directory: {output_dir}"
+            )
+        with os.scandir(output_dir) as entries:
+            if next(entries, None) is not None:
+                raise RuntimeError(
+                    f"XDF output directory is not empty: {output_dir}. "
+                    "Choose a new empty directory so stale files cannot be "
+                    "mistaken for this extraction."
+                )
+    else:
+        os.makedirs(output_dir)
+    return output_dir
+
+
+def _unwrap_singleton(value):
+    """Unwrap list/array containers used by pyxdf for scalar metadata."""
+    while True:
+        if isinstance(value, np.ndarray) and value.size == 1:
+            value = value.reshape(-1)[0]
+            continue
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+            continue
+        return value
+
+
+def _metadata_values_for_keys(payload, keys):
+    """Recursively collect values for metadata keys from pyxdf structures."""
+    values = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower() in keys:
+                values.append(_unwrap_singleton(value))
+            values.extend(_metadata_values_for_keys(value, keys))
+    elif isinstance(payload, (list, tuple)):
+        for value in payload:
+            values.extend(_metadata_values_for_keys(value, keys))
+    elif isinstance(payload, np.ndarray) and payload.dtype == object:
+        for value in payload.reshape(-1):
+            values.extend(_metadata_values_for_keys(value, keys))
+    return values
+
+
+def _validated_depth_scale(value, source):
+    """Validate a metres-per-device-unit depth scale."""
+    value = _unwrap_singleton(value)
+    try:
+        scale = float(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"invalid depth scale from {source}: expected a number, got {value!r}"
+        ) from error
+    if not np.isfinite(scale) or scale <= 0:
+        raise RuntimeError(
+            f"invalid depth scale from {source}: expected a finite positive "
+            f"metres-per-unit value, got {value!r}"
+        )
+    return scale
+
+
+def _one_consistent_depth_scale(values, source):
+    """Return one validated scale, rejecting conflicting metadata."""
+    scales = [_validated_depth_scale(value, source) for value in values]
+    if not scales:
+        return None
+    first = scales[0]
+    if any(not np.isclose(first, scale, rtol=1e-9, atol=0.0) for scale in scales[1:]):
+        raise RuntimeError(
+            f"conflicting depth scales in {source}: "
+            + ", ".join(f"{scale:.17g}" for scale in scales)
+        )
+    return first
+
+
+def _decode_metadata_sample(sample):
+    """Decode one JSON metadata sample, returning an empty mapping if unrelated."""
+    sample = _unwrap_singleton(sample)
+    if isinstance(sample, bytes):
+        sample = sample.decode("utf-8")
+    if isinstance(sample, str):
+        try:
+            sample = json.loads(sample)
+        except json.JSONDecodeError:
+            return {}
+    return sample if isinstance(sample, dict) else {}
+
+
+def _stream_family(name):
+    """Return the device-family portion used to pair depth and metadata streams."""
+    parts = [part for part in re.split(r"[^a-z0-9]+", name.lower()) if part]
+    ignored = {"depth", "metadata", "deviceinfo", "device", "info", "color"}
+    return "_".join(part for part in parts if part not in ignored)
+
+
+def _resolve_depth_scale(depth_stream, all_streams=None):
+    """Resolve the recorded hardware scale for one raw depth stream.
+
+    Numeric metadata embedded in the depth stream is preferred. Older NaturalLab
+    recordings stored the same value in a paired ``DeviceInfo`` stream, which is
+    used only when it can be associated unambiguously.
+    """
+    stream_name = _stream_name(depth_stream)
+    scale_keys = {"depth_scale_m_per_unit", "depth_scale"}
+    embedded_values = _metadata_values_for_keys(
+        depth_stream.get("info", {}),
+        scale_keys,
+    )
+    embedded_scale = _one_consistent_depth_scale(
+        embedded_values,
+        f"{stream_name} stream metadata",
+    )
+
+    available_streams = list(all_streams or [])
+    depth_stream_count = sum(
+        _stream_type(candidate).lower() in {"depth", "depthdata"}
+        for candidate in available_streams
+    )
+    metadata_records = []
+    for candidate in available_streams:
+        candidate_name = _stream_name(candidate)
+        if (
+            _stream_type(candidate).lower() != "deviceinfo"
+            and "metadata" not in candidate_name.lower()
+        ):
+            continue
+        values = []
+        for sample in candidate.get("time_series", []):
+            values.extend(
+                _metadata_values_for_keys(
+                    _decode_metadata_sample(sample),
+                    scale_keys,
+                )
+            )
+        scale = _one_consistent_depth_scale(
+            values,
+            f"{candidate_name} metadata stream",
+        )
+        if scale is not None:
+            metadata_records.append((candidate_name, scale))
+
+    depth_family = _stream_family(stream_name)
+    paired_records = [
+        record
+        for record in metadata_records
+        if depth_family and _stream_family(record[0]) == depth_family
+    ]
+
+    if embedded_scale is not None:
+        for metadata_name, metadata_scale in paired_records:
+            if not np.isclose(
+                embedded_scale,
+                metadata_scale,
+                rtol=1e-9,
+                atol=0.0,
+            ):
+                raise RuntimeError(
+                    f"conflicting depth scales for {stream_name}: stream "
+                    f"metadata has {embedded_scale:.17g} m/unit but "
+                    f"{metadata_name} has {metadata_scale:.17g} m/unit"
+                )
+        return embedded_scale, "depth stream metadata"
+
+    candidates = paired_records
+    if (
+        not candidates
+        and len(metadata_records) == 1
+        and depth_stream_count == 1
+    ):
+        candidates = metadata_records
+    if candidates:
+        scale = _one_consistent_depth_scale(
+            [record[1] for record in candidates],
+            f"metadata associated with {stream_name}",
+        )
+        sources = ", ".join(record[0] for record in candidates)
+        return scale, f"DeviceInfo stream {sources}"
+
+    if metadata_records:
+        names = ", ".join(record[0] for record in metadata_records)
+        raise RuntimeError(
+            f"cannot associate a recorded depth scale with {stream_name}; "
+            f"candidate metadata streams: {names}"
+        )
+    raise RuntimeError(
+        f"no recorded depth scale is available for {stream_name}; metric depth "
+        "cannot be produced safely. Record depth_scale_m_per_unit in the depth "
+        "stream metadata or a paired DeviceInfo stream."
+    )
+
 
 def _decode_lsl_video_frame(frame_data, frame_index, stream_name):
     """Decode one base64 JPEG frame or fail without changing frame indices."""
@@ -141,123 +387,89 @@ def extract_video_stream(stream, output_dir, name=None):
     print(f"Timestamps saved to: {timestamp_file}")
 
 def extract_audio_stream(stream, output_dir, name=None):
-    """Extract an audio stream from XDF to WAV"""
+    """Extract one sample-aligned LSL audio stream to WAV and timestamps."""
     stream_name = name or stream['info']['name'][0]
     print(f"Extracting audio stream: {stream_name}")
-    
-    # Create output WAV file
+
     output_file = os.path.join(output_dir, f"{stream_name}.wav")
-    
-    # Extract timestamps and audio data
-    timestamps = stream['time_stamps']
+    partial_file = os.path.join(output_dir, f".{stream_name}.partial.wav")
+    timestamps = np.asarray(stream['time_stamps'], dtype=np.float64)
     audio_data = stream['time_series']
-    
+
     if audio_data is None or len(audio_data) == 0:
-        print(f"No data found in audio stream: {stream_name}")
-        return
-    
-    # Determine audio properties
-    sample_rate = float(stream['info']['nominal_srate'][0])
+        raise RuntimeError(f"no audio samples found in stream: {stream_name}")
+
+    sample_rate_value = float(stream['info']['nominal_srate'][0])
+    if not np.isfinite(sample_rate_value) or sample_rate_value <= 0:
+        raise RuntimeError(
+            f"invalid nominal sample rate for {stream_name}: {sample_rate_value!r}"
+        )
+    sample_rate = int(round(sample_rate_value))
+    if not np.isclose(sample_rate, sample_rate_value):
+        raise RuntimeError(
+            f"non-integral nominal sample rate for {stream_name}: "
+            f"{sample_rate_value!r}"
+        )
     print(f"Sample rate: {sample_rate} Hz")
-    
-    # Get channel count
+
     channel_count = int(stream['info']['channel_count'][0])
+    if channel_count <= 0:
+        raise RuntimeError(
+            f"invalid channel count for {stream_name}: {channel_count!r}"
+        )
     print(f"Channels: {channel_count}")
-    
-    # Try to import specialized audio libraries
+
     try:
         import soundfile as sf
-    except ImportError:
-        print(
-            "Audio extraction requires soundfile. Install the acquisition "
-            "extra before rerunning."
-        )
-        return
-    audio_lib_available = True
-    
-    # Convert audio data into a continuous array
+    except ImportError as error:
+        raise RuntimeError(
+            "audio extraction requires soundfile; install "
+            "NaturalLab's acquisition extra"
+        ) from error
+
     try:
-        # Audio data might be in chunks
-        all_audio = []
-        for chunk in tqdm(audio_data, desc="Processing audio chunks"):
-            # Handle different types of chunks
-            if isinstance(chunk, np.ndarray):
-                all_audio.append(chunk)
-            elif isinstance(chunk, list):
-                # Convert list to numpy array
-                all_audio.append(np.array(chunk))
-            else:
-                print(f"Warning: Unknown audio chunk type: {type(chunk)}")
-        
-        # Determine the shape and combine
-        if len(all_audio) > 0:
-            try:
-                # Try to stack vertically
-                audio_array = np.vstack(all_audio)
-            except ValueError:
-                # If shapes are incompatible, try concatenating
-                print("Warning: Audio chunks have inconsistent shapes, trying concatenation")
-                audio_array = np.concatenate([chunk.flatten() for chunk in all_audio])
-                
-                # Try to reshape to match channel count
-                if channel_count > 1:
-                    # Make sure length is divisible by channel count
-                    length = (len(audio_array) // channel_count) * channel_count
-                    audio_array = audio_array[:length].reshape(-1, channel_count)
-        else:
-            print("No audio chunks found")
-            return
-        
+        audio_array = np.asarray(audio_data, dtype=np.float32)
+        if audio_array.ndim == 1:
+            audio_array = audio_array.reshape(-1, 1)
+        if audio_array.ndim != 2 or audio_array.shape[1] != channel_count:
+            raise RuntimeError(
+                f"audio shape {audio_array.shape!r} does not match the declared "
+                f"{channel_count} channel(s)"
+            )
+        if len(timestamps) != len(audio_array):
+            raise RuntimeError(
+                f"audio timestamp/sample mismatch for {stream_name}: "
+                f"{len(timestamps)} timestamps for {len(audio_array)} samples"
+            )
+        if not np.all(np.isfinite(audio_array)):
+            raise RuntimeError(f"audio contains non-finite samples: {stream_name}")
+        if not np.all(np.isfinite(timestamps)):
+            raise RuntimeError(f"audio contains non-finite timestamps: {stream_name}")
+        if len(timestamps) > 1 and np.any(np.diff(timestamps) <= 0):
+            raise RuntimeError(
+                f"audio timestamps are not strictly increasing: {stream_name}"
+            )
+
         print(f"Audio array shape: {audio_array.shape}")
-        
-        # Save as WAV file
-        if audio_lib_available:
-            if audio_array.dtype != np.int16 and audio_array.dtype != np.float32:
-                # Convert to float32 in the range [-1, 1]
-                audio_array = audio_array.astype(np.float32)
-                if np.max(np.abs(audio_array)) > 1.0:
-                    audio_array = audio_array / np.max(np.abs(audio_array))
-            
-            sf.write(output_file, audio_array, int(sample_rate))
-            print(f"Audio saved to: {output_file}")
-        else:
-            print("Could not save audio: audio libraries not available")
-            
-        # Create a CSV with timestamps
+        sf.write(partial_file, audio_array, sample_rate)
+        os.replace(partial_file, output_file)
+        print(f"Audio saved to: {output_file}")
+
         timestamp_file = os.path.join(output_dir, f"{stream_name}_timestamps.csv")
         timestamp_df = pd.DataFrame({
-            'chunk_index': range(len(timestamps)),
+            'sample_index': range(len(timestamps)),
             'timestamp': timestamps,
-            'datetime': [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
+            'timestamp_domain': ['lsl'] * len(timestamps),
         })
         timestamp_df.to_csv(timestamp_file, index=False)
         print(f"Timestamps saved to: {timestamp_file}")
-        
-    except Exception as e:
-        print(f"Error processing audio stream: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
+        return output_file
+    except Exception:
         try:
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-            
-            # Save numpy array if possible
-            if 'audio_array' in locals() and audio_array is not None:
-                np.save(np_file, audio_array)
-                print(f"Fallback: Audio data saved as numpy file: {np_file}")
-            
-            # Save JSON metadata
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'sample_rate': sample_rate,
-                    'channel_count': channel_count,
-                    'timestamps': timestamps.tolist()
-                }, f)
-            print(f"Fallback: Audio metadata saved to {fallback_file}")
-        except Exception as fallback_error:
-            print(f"Fallback save also failed: {fallback_error}")
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        raise
 
 def extract_gaze_stream(stream, output_dir, name=None):
     """Extract a gaze stream from XDF to CSV with support for both API and LSL formats"""
@@ -352,79 +564,6 @@ def extract_gaze_stream(stream, output_dir, name=None):
             # Single-column data
             df = pd.DataFrame({column_names[0]: gaze_data})
             
-        if format_type == "LSL" and max(timestamps) < 1500000000:  # ~July 2017
-            print(f"LSL gaze timestamps appear to be relative (max: {max(timestamps):.2f})")
-            
-            # Store original timestamps
-            df['lsl_relative_timestamp'] = timestamps
-            
-            # Look for reference streams with absolute timestamps
-            reference_time = None
-            time_offset = None
-            
-            # Check IMU file first (most likely to have consistent absolute timestamps)
-            imu_path = os.path.join(output_dir, "imu.csv")
-            if os.path.exists(imu_path):
-                try:
-                    imu_df = pd.read_csv(imu_path)
-                    if 'timestamp [ns]' in imu_df.columns:
-                        # Get first timestamp in nanoseconds and convert to seconds
-                        first_imu_time = imu_df['timestamp [ns]'].iloc[0] / 1e9
-                        # Assuming first IMU timestamp corresponds roughly to first gaze timestamp
-                        time_offset = first_imu_time - timestamps[0]
-                        reference_time = first_imu_time
-                        print(f"Using IMU reference timestamp: {datetime.fromtimestamp(first_imu_time).strftime('%Y-%m-%d %H:%M:%S')}")
-                except Exception as e:
-                    print(f"Error reading IMU file: {e}")
-            
-            # Try fixations if IMU not available
-            if reference_time is None:
-                fix_path = os.path.join(output_dir, "fixations.csv")
-                if os.path.exists(fix_path):
-                    try:
-                        fix_df = pd.read_csv(fix_path)
-                        if 'start_timestamp [ns]' in fix_df.columns:
-                            first_fix_time = fix_df['start_timestamp [ns]'].iloc[0] / 1e9
-                            time_offset = first_fix_time - timestamps[0]
-                            reference_time = first_fix_time
-                            print(f"Using fixations reference timestamp: {datetime.fromtimestamp(first_fix_time).strftime('%Y-%m-%d %H:%M:%S')}")
-                    except Exception as e:
-                        print(f"Error reading fixations file: {e}")
-            
-            # Try saccades as last resort
-            if reference_time is None:
-                sac_path = os.path.join(output_dir, "saccades.csv")
-                if os.path.exists(sac_path):
-                    try:
-                        sac_df = pd.read_csv(sac_path)
-                        if 'start_timestamp [ns]' in sac_df.columns:
-                            first_sac_time = sac_df['start_timestamp [ns]'].iloc[0] / 1e9
-                            time_offset = first_sac_time - timestamps[0]
-                            reference_time = first_sac_time
-                            print(f"Using saccades reference timestamp: {datetime.fromtimestamp(first_sac_time).strftime('%Y-%m-%d %H:%M:%S')}")
-                    except Exception as e:
-                        print(f"Error reading saccades file: {e}")
-            
-            # Apply timestamp correction if we found a reference
-            if time_offset is not None:
-                print(f"Applying timestamp offset of {time_offset:.2f} seconds")
-                
-                # Apply offset to all timestamps
-                adjusted_timestamps = timestamps + time_offset
-                
-                # Update timestamp columns
-                df['timestamp'] = adjusted_timestamps
-                df['timestamp [ns]'] = (adjusted_timestamps * 1e9).astype(np.int64)  # Add nanosecond version
-                df['datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') 
-                                   for ts in adjusted_timestamps]
-                
-                print(f"Adjusted timestamps range: {datetime.fromtimestamp(min(adjusted_timestamps)).strftime('%Y-%m-%d %H:%M:%S')} to {datetime.fromtimestamp(max(adjusted_timestamps)).strftime('%Y-%m-%d %H:%M:%S')}")
-            else:
-                # Fallback if no reference streams found
-                print("WARNING: No reference streams with absolute timestamps found.")
-                print("Timestamps will remain as relative values and show dates from 1970.")
-                print("Consider re-extracting this data with other streams that contain absolute timestamps.")
-        
         # Reset frame_index for API format
         if format_type == "API" and 'frame_index' in df.columns:
             if not pd.isna(df['frame_index']).all():  # Make sure frame_index column has valid data
@@ -435,10 +574,16 @@ def extract_gaze_stream(stream, output_dir, name=None):
                     df['frame_index'] = df['frame_index'] - first_frame
                     print(f"Reset frame_index to start at 0 (original first frame: {first_frame})")
         
-        # Add additional columns at the end
-        if 'timestamp' not in df.columns:  # Only add if not already done by the adjustment code
-            df['timestamp'] = timestamps
-            df['datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
+        timestamp_values = np.asarray(timestamps, dtype=np.float64)
+        if len(timestamp_values) != len(df):
+            raise RuntimeError(
+                f"gaze timestamp/sample mismatch for {stream_name}: "
+                f"{len(timestamp_values)} timestamps for {len(df)} samples"
+            )
+        if not np.all(np.isfinite(timestamp_values)):
+            raise RuntimeError(f"gaze contains non-finite timestamps: {stream_name}")
+        df['timestamp'] = timestamp_values
+        df['timestamp_domain'] = 'lsl'
         df['format_type'] = format_type
         
         # Add data_type for LSL format
@@ -454,32 +599,12 @@ def extract_gaze_stream(stream, output_dir, name=None):
         print(f"Gaze data saved to: {output_file}")
         print(f"Gaze format identified as: {format_type}")
         
-    except Exception as e:
-        print(f"Error creating DataFrame: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
+    except Exception:
         try:
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                # Convert numpy arrays to lists for JSON serialization
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'data_shape': gaze_data.shape,
-                    'data_sample': gaze_data[0].tolist() if len(gaze_data) > 0 else [],
-                    'format_type': format_type
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            
-            # Also try to save as numpy file
-            np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-            np.save(np_file, gaze_data)
-            np_timestamps = os.path.join(output_dir, f"{stream_name}_timestamps.npy")
-            np.save(np_timestamps, timestamps)
-            print(f"Fallback: Data saved as numpy files: {np_file} and {np_timestamps}")
-        except Exception as fallback_error:
-            print(f"Fallback save also failed: {fallback_error}")
+            os.remove(output_file)
+        except FileNotFoundError:
+            pass
+        raise
 
 def extract_metadata_stream(stream, output_dir, name=None):
     """Extract a metadata stream from XDF to JSON"""
@@ -537,35 +662,55 @@ def extract_metadata_stream(stream, output_dir, name=None):
     
     print(f"Metadata saved to: {output_file}")
 
-def extract_depth_stream(stream, output_dir, name=None, save_interval=30, include_csv=False):
-    """Extract a depth stream from XDF to both MP4 visualization and raw depth data"""
+def extract_depth_stream(
+    stream,
+    output_dir,
+    name=None,
+    save_interval=30,
+    include_csv=False,
+    depth_scale_m_per_unit=None,
+    depth_scale_source=None,
+):
+    """Extract raw depth plus metric derivatives using a recorded sensor scale."""
     stream_name = name or stream['info']['name'][0]
     print(f"Extracting depth stream: {stream_name}")
-    
-    # Create output directory
-    depth_dir = os.path.join(output_dir, f"{stream_name}_depth")
-    os.makedirs(depth_dir, exist_ok=True)
-    
-    # Output MP4 file for visualization
-    output_file = os.path.join(output_dir, f"{stream_name}_visualization.mp4")
-    
+
     # Extract timestamps and frame data
     timestamps = stream['time_stamps']
     frames_data = stream['time_series']
-    
+
     if frames_data is None or len(frames_data) == 0:
         print(f"No data found in depth stream: {stream_name}")
         return
-    
+    if save_interval <= 0:
+        raise ValueError("depth save interval must be a positive integer")
+
+    if depth_scale_m_per_unit is None:
+        depth_scale, resolved_source = _resolve_depth_scale(stream, [stream])
+        depth_scale_source = depth_scale_source or resolved_source
+    else:
+        depth_scale = _validated_depth_scale(
+            depth_scale_m_per_unit,
+            depth_scale_source or f"{stream_name} extraction metadata",
+        )
+        depth_scale_source = depth_scale_source or "extraction metadata"
+    print(
+        "Depth scale: "
+        f"{depth_scale!r} metres per raw device unit "
+        f"(source: {depth_scale_source})"
+    )
+
+    # Create outputs only after metric conversion has been established.
+    depth_dir = os.path.join(output_dir, f"{stream_name}_depth")
+    os.makedirs(depth_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, f"{stream_name}_visualization.mp4")
+
     # Determine frame rate from timestamps
     frame_intervals = np.diff(timestamps)
     avg_interval = np.mean(frame_intervals) if len(frame_intervals) > 0 else 1/30
     fps = 1.0 / avg_interval if avg_interval > 0 else 30
     print(f"Estimated frame rate: {fps:.2f} FPS")
-    
-    # Check stream info for depth scale if available
-    depth_scale = 0.001  # Default: 1mm = 0.001m
-    
+
     # Process frames - first pass to get statistics and first frame
     depth_min_global = float('inf')
     depth_max_global = 0
@@ -728,7 +873,29 @@ def extract_depth_stream(stream, output_dir, name=None, save_interval=30, includ
     print(f"Depth visualization saved to: {output_file}")
     print(f"Raw depth samples ({frame_counter} frames) saved to: {depth_dir}")
     print(f"Timestamps saved to: {timestamp_file}")
-    print(f"Note: Raw depth values are in millimeters, scale by {depth_scale} to get meters")
+    depth_metadata_file = os.path.join(
+        output_dir,
+        f"{stream_name}_depth_metadata.json",
+    )
+    depth_metadata = {
+        "stream_name": stream_name,
+        "raw_encoding": f"{first_raw_depth.dtype} PNG",
+        "raw_value_unit": "device_depth_unit",
+        "depth_scale_m_per_unit": depth_scale,
+        "depth_scale_source": depth_scale_source,
+        "metric_distance_unit": "metre",
+        "distance_csv_unit": "metre" if include_csv else None,
+    }
+    with open(depth_metadata_file, "w", encoding="utf-8") as file_handle:
+        json.dump(depth_metadata, file_handle, indent=2)
+        file_handle.write("\n")
+
+    print(f"Depth metadata saved to: {depth_metadata_file}")
+    print(
+        "Raw depth PNG values are device units; multiply by "
+        f"{depth_scale!r} metres per unit for metric distances"
+    )
+    return depth_metadata
 
 
 def extract_generic_stream(stream, output_dir, name=None):
@@ -835,175 +1002,122 @@ def extract_generic_stream(stream, output_dir, name=None):
             except Exception as np_error:
                 print(f"Error saving numpy fallback: {np_error}")
             
-def extract_imu_stream(stream, output_dir, name=None):
-    """Extract IMU data from XDF to CSV following the specified format"""
+def extract_imu_stream(stream, output_dir, name=None, output_filename=None):
+    """Extract one validated IMU stream without changing its LSL clock."""
     stream_name = name or stream['info']['name'][0]
     print(f"Extracting IMU stream: {stream_name}")
-    
-    # Create output CSV file
-    output_file = os.path.join(output_dir, "imu.csv")
-    
-    # Extract timestamps and IMU data
-    timestamps = stream['time_stamps']
-    imu_data = stream['time_series']
-    
-    if imu_data is None or len(imu_data) == 0:
-        print(f"No data found in IMU stream: {stream_name}")
-        return
-    
-    # Print basic info about the data
-    print(f"IMU data type: {type(imu_data)}")
-    print(f"IMU data shape: {imu_data.shape if hasattr(imu_data, 'shape') else 'unknown'}")
-    print(f"First sample type: {type(imu_data[0]) if len(imu_data) > 0 else 'N/A'}")
-    
-    # Convert to proper array if needed
-    if not isinstance(imu_data, np.ndarray):
-        try:
-            imu_data = np.array(imu_data)
-            print(f"Converted IMU data to numpy array with shape: {imu_data.shape}")
-        except Exception as e:
-            print(f"Error converting IMU data to numpy array: {e}")
-            
-            # Fallback: Save what we can
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'sample_count': len(imu_data)
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            return
-    
-    # Get channel count
-    channel_count = int(stream['info']['channel_count'][0])
-    print(f"Channel count from stream info: {channel_count}")
-    
-    # Expected column names for IMU data
-    imu_columns = [
-        "gyro_x", "gyro_y", "gyro_z", 
-        "accel_x", "accel_y", "accel_z", 
-        "roll", "pitch", "yaw", 
-        "quaternion_w", "quaternion_x", "quaternion_y", "quaternion_z"
-    ]
-    
-    # Adjust column names based on actual data
-    if len(imu_data.shape) > 1:
-        if imu_data.shape[1] < len(imu_columns):
-            # Use only as many columns as we have in the data
-            column_names = imu_columns[:imu_data.shape[1]]
-            print(f"Warning: IMU data has fewer columns ({imu_data.shape[1]}) than expected ({len(imu_columns)})")
-        elif imu_data.shape[1] > len(imu_columns):
-            # If we have more columns than expected, add generic names
-            column_names = imu_columns.copy()
-            column_names.extend([f"extra_{i}" for i in range(len(imu_columns), imu_data.shape[1])])
-            print(f"Warning: IMU data has more columns ({imu_data.shape[1]}) than expected ({len(imu_columns)})")
-        else:
-            column_names = imu_columns.copy()
-    else:
-        # Single column data (unlikely for IMU)
-        column_names = [imu_columns[0]]
-        print("Warning: IMU data appears to have only one column")
-    
+
+    # A direct/single-stream call keeps the historical ``imu.csv`` contract.
+    output_filename = output_filename or "imu.csv"
+    if os.path.basename(output_filename) != output_filename:
+        raise ValueError("IMU output filename must not contain a directory")
+    output_file = os.path.join(output_dir, output_filename)
+    partial_file = os.path.join(output_dir, f".{output_filename}.partial")
+
     try:
-        # Create DataFrame
-        if len(imu_data.shape) > 1:
-            # Multi-column data
-            df = pd.DataFrame(imu_data, columns=column_names)
-        else:
-            # Single-column data
-            df = pd.DataFrame({column_names[0]: imu_data})
-        
-        # Add timestamp columns in nanoseconds as required by the format
-        df['timestamp [ns]'] = (timestamps * 1e9).astype(np.int64)  # Convert to nanoseconds
-        
-        # Add a section_id and recording_id for compatibility
-        df['section_id'] = 1
-        df['recording_id'] = 1
-        
-        # Add datetime for readability
-        df['datetime'] = [datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f') for ts in timestamps]
-        
-        # Reorder columns to match expected format
-        ordered_cols = ['section_id', 'recording_id', 'timestamp [ns]']
-        ordered_cols.extend([
-            'gyro_x [deg/s]' if 'gyro_x' in df.columns else 'gyro_x', 
-            'gyro_y [deg/s]' if 'gyro_y' in df.columns else 'gyro_y', 
-            'gyro_z [deg/s]' if 'gyro_z' in df.columns else 'gyro_z',
-            'acceleration_x [g]' if 'acceleration_x' in df.columns else 'accel_x [g]' if 'accel_x' in df.columns else 'accel_x',
-            'acceleration_y [g]' if 'acceleration_y' in df.columns else 'accel_y [g]' if 'accel_y' in df.columns else 'accel_y',
-            'acceleration_z [g]' if 'acceleration_z' in df.columns else 'accel_z [g]' if 'accel_z' in df.columns else 'accel_z',
-            'roll [deg]' if 'roll' in df.columns else 'roll',
-            'pitch [deg]' if 'pitch' in df.columns else 'pitch',
-            'yaw [deg]' if 'yaw' in df.columns else 'yaw',
-            'quaternion_w' if 'quaternion_w' in df.columns else 'quat_w' if 'quat_w' in df.columns else 'quaternion_w',
-            'quaternion_x' if 'quaternion_x' in df.columns else 'quat_x' if 'quat_x' in df.columns else 'quaternion_x',
-            'quaternion_y' if 'quaternion_y' in df.columns else 'quat_y' if 'quat_y' in df.columns else 'quaternion_y',
-            'quaternion_z' if 'quaternion_z' in df.columns else 'quat_z' if 'quat_z' in df.columns else 'quaternion_z'
-        ])
-        
-        # Add any extra columns
-        extra_cols = [col for col in df.columns if col not in ordered_cols and col != 'datetime']
-        ordered_cols.extend(extra_cols)
-        ordered_cols.append('datetime')  # Add datetime at the end
-        
-        # Ensure all required columns exist in dataframe
-        final_cols = []
-        for col in ordered_cols:
-            if col in df.columns:
-                final_cols.append(col)
-        
-        # Rename columns to match expected format with units in column names
-        if 'gyro_x' in df.columns and 'gyro_x [deg/s]' not in df.columns:
-            df.rename(columns={'gyro_x': 'gyro_x [deg/s]'}, inplace=True)
-        if 'gyro_y' in df.columns and 'gyro_y [deg/s]' not in df.columns:
-            df.rename(columns={'gyro_y': 'gyro_y [deg/s]'}, inplace=True)
-        if 'gyro_z' in df.columns and 'gyro_z [deg/s]' not in df.columns:
-            df.rename(columns={'gyro_z': 'gyro_z [deg/s]'}, inplace=True)
-            
-        if 'accel_x' in df.columns and 'accel_x [g]' not in df.columns:
-            df.rename(columns={'accel_x': 'accel_x [g]'}, inplace=True)
-        if 'accel_y' in df.columns and 'accel_y [g]' not in df.columns:
-            df.rename(columns={'accel_y': 'accel_y [g]'}, inplace=True)
-        if 'accel_z' in df.columns and 'accel_z [g]' not in df.columns:
-            df.rename(columns={'accel_z': 'accel_z [g]'}, inplace=True)
-            
-        if 'roll' in df.columns and 'roll [deg]' not in df.columns:
-            df.rename(columns={'roll': 'roll [deg]'}, inplace=True)
-        if 'pitch' in df.columns and 'pitch [deg]' not in df.columns:
-            df.rename(columns={'pitch': 'pitch [deg]'}, inplace=True)
-        if 'yaw' in df.columns and 'yaw [deg]' not in df.columns:
-            df.rename(columns={'yaw': 'yaw [deg]'}, inplace=True)
-        
-        # Save to CSV with standardized column names
-        final_df = df.copy()
-        final_df.to_csv(output_file, index=False)
-        print(f"IMU data saved to: {output_file}")
-        
-    except Exception as e:
-        print(f"Error creating DataFrame: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Fallback: save raw data and timestamps
+        channel_count = int(stream['info']['channel_count'][0])
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"invalid channel count for IMU stream {stream_name}"
+        ) from error
+    if channel_count <= 0:
+        raise RuntimeError(
+            f"invalid channel count for IMU stream {stream_name}: "
+            f"{channel_count!r}"
+        )
+
+    raw_imu_data = stream.get('time_series')
+    if raw_imu_data is None or len(raw_imu_data) == 0:
+        raise RuntimeError(f"no IMU samples found in stream: {stream_name}")
+    try:
+        imu_data = np.asarray(raw_imu_data, dtype=np.float64)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"IMU samples are not a rectangular numeric array: {stream_name}"
+        ) from error
+
+    try:
+        timestamps = np.asarray(stream['time_stamps'], dtype=np.float64)
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"IMU timestamps are not a numeric array: {stream_name}"
+        ) from error
+
+    # A single recorded sample may be represented as a flat channel vector.
+    if imu_data.ndim == 1 and len(timestamps) == 1 and len(imu_data) == channel_count:
+        imu_data = imu_data.reshape(1, channel_count)
+    if imu_data.ndim != 2:
+        raise RuntimeError(
+            f"IMU data for {stream_name} must be a sample-by-channel matrix; "
+            f"got shape {imu_data.shape!r}"
+        )
+    if imu_data.shape[1] != channel_count:
+        raise RuntimeError(
+            f"IMU channel mismatch for {stream_name}: metadata declares "
+            f"{channel_count}, data has {imu_data.shape[1]}"
+        )
+    if timestamps.ndim != 1:
+        raise RuntimeError(
+            f"IMU timestamps for {stream_name} must be one-dimensional; "
+            f"got shape {timestamps.shape!r}"
+        )
+    if len(timestamps) != len(imu_data):
+        raise RuntimeError(
+            f"IMU timestamp/sample mismatch for {stream_name}: "
+            f"{len(timestamps)} timestamps for {len(imu_data)} samples"
+        )
+    if not np.all(np.isfinite(imu_data)):
+        raise RuntimeError(f"IMU contains non-finite samples: {stream_name}")
+    if not np.all(np.isfinite(timestamps)):
+        raise RuntimeError(f"IMU contains non-finite timestamps: {stream_name}")
+    if len(timestamps) > 1 and np.any(np.diff(timestamps) <= 0):
+        raise RuntimeError(
+            f"IMU timestamps are not strictly increasing: {stream_name}"
+        )
+
+    imu_columns = [
+        "gyro_x [deg/s]",
+        "gyro_y [deg/s]",
+        "gyro_z [deg/s]",
+        "accel_x [g]",
+        "accel_y [g]",
+        "accel_z [g]",
+        "roll [deg]",
+        "pitch [deg]",
+        "yaw [deg]",
+        "quaternion_w",
+        "quaternion_x",
+        "quaternion_y",
+        "quaternion_z",
+    ]
+    column_names = imu_columns[:channel_count]
+    column_names.extend(
+        f"extra_{index}" for index in range(len(imu_columns), channel_count)
+    )
+
+    sensor_data = pd.DataFrame(imu_data, columns=column_names)
+    metadata = pd.DataFrame(
+        {
+            "section_id": np.ones(len(timestamps), dtype=np.int64),
+            "recording_id": np.ones(len(timestamps), dtype=np.int64),
+            "timestamp": timestamps,
+            "timestamp_domain": ["lsl"] * len(timestamps),
+        }
+    )
+    final_df = pd.concat([metadata, sensor_data], axis=1)
+
+    try:
+        final_df.to_csv(partial_file, index=False)
+        os.replace(partial_file, output_file)
+    except Exception:
         try:
-            fallback_file = os.path.join(output_dir, f"{stream_name}_raw.json")
-            with open(fallback_file, 'w') as f:
-                # Convert numpy arrays to lists for JSON serialization
-                json.dump({
-                    'timestamps': timestamps.tolist(),
-                    'data_shape': imu_data.shape,
-                    'data_sample': imu_data[0].tolist() if len(imu_data) > 0 else []
-                }, f)
-            print(f"Fallback: Basic info saved to {fallback_file}")
-            
-            # Also try to save as numpy file
-            np_file = os.path.join(output_dir, f"{stream_name}_data.npy")
-            np.save(np_file, imu_data)
-            np_timestamps = os.path.join(output_dir, f"{stream_name}_timestamps.npy")
-            np.save(np_timestamps, timestamps)
-            print(f"Fallback: Data saved as numpy files: {np_file} and {np_timestamps}")
-        except Exception as fallback_error:
-            print(f"Fallback save also failed: {fallback_error}")
+            os.remove(partial_file)
+        except FileNotFoundError:
+            pass
+        raise
+
+    print(f"IMU data saved to: {output_file}")
+    return output_file
 
 def extract_fixations_stream(stream, output_dir, name=None):
     """Extract fixations data from XDF to CSV following the specified format"""
@@ -1382,8 +1496,8 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
         # Load XDF file
         streams, fileheader = pyxdf.load_xdf(xdf_file)
         
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
+        # A reused directory can mix files from different sessions or roles.
+        output_dir = _prepare_extraction_output_dir(output_dir)
         
         print(f"XDF file loaded. Found {len(streams)} streams:")
         
@@ -1394,6 +1508,15 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
             channel_count = int(stream['info']['channel_count'][0])
             sample_count = len(stream['time_series'])
             print(f"  {i+1}. {name} (Type: {stream_type}, Channels: {channel_count}, Samples: {sample_count})")
+
+        declared_imu_streams = [
+            stream for stream in streams if _is_declared_imu_stream(stream)
+        ]
+        imu_filenames = _plan_imu_output_filenames(declared_imu_streams)
+        imu_filename_by_id = {
+            id(stream): filename
+            for stream, filename in zip(declared_imu_streams, imu_filenames)
+        }
         
         # Track any depth raw folders for cleanup if needed
         depth_raw_dirs = []
@@ -1403,6 +1526,8 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
         found_fixations = False
         found_saccades = False
         extraction_errors = []
+        imu_outputs = []
+        depth_outputs = []
         
         # First pass - extract normal streams and identify special streams
         for stream in streams:
@@ -1412,9 +1537,15 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                 stream_type = stream['info']['type'][0]
                 
                 # Check for specialized streams by name and type
-                if stream_type == 'IMU' or name.lower() in ['neonimu', 'neon_imu', 'imu']:
+                if _is_declared_imu_stream(stream):
                     found_imu = True
-                    extract_imu_stream(stream, output_dir)
+                    output_path = extract_imu_stream(
+                        stream,
+                        output_dir,
+                        output_filename=imu_filename_by_id[id(stream)],
+                    )
+                    if output_path is not None:
+                        imu_outputs.append((name, os.path.basename(output_path)))
                     continue
                     
                 if name.lower() in ['neonfixations', 'neon_fixations', 'fixations']:
@@ -1435,7 +1566,20 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                     depth_dir = os.path.join(output_dir, f"{name}_depth")
                     if not keep_raw_depth:
                         depth_raw_dirs.append(depth_dir)
-                    extract_depth_stream(stream, output_dir, save_interval=depth_interval, include_csv=include_csv)
+                    depth_scale, scale_source = _resolve_depth_scale(
+                        stream,
+                        streams,
+                    )
+                    depth_result = extract_depth_stream(
+                        stream,
+                        output_dir,
+                        save_interval=depth_interval,
+                        include_csv=include_csv,
+                        depth_scale_m_per_unit=depth_scale,
+                        depth_scale_source=scale_source,
+                    )
+                    if depth_result is not None:
+                        depth_outputs.append(depth_result)
                 elif stream_type == 'Audio':
                     extract_audio_stream(stream, output_dir)
                 elif stream_type == 'Gaze':
@@ -1452,7 +1596,11 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                         extract_saccades_stream(stream, output_dir)
                     elif 'imu' in name.lower() and not found_imu:
                         found_imu = True
-                        extract_imu_stream(stream, output_dir)
+                        output_path = extract_imu_stream(stream, output_dir)
+                        if output_path is not None:
+                            imu_outputs.append(
+                                (name, os.path.basename(output_path))
+                            )
                     else:
                         # Generic stream extractor for other types
                         extract_generic_stream(stream, output_dir)
@@ -1476,7 +1624,7 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                     channel_count = int(stream['info']['channel_count'][0])
                     
                     # Skip already processed specialized streams
-                    if ((stream_type == 'IMU' or name.lower() in ['neonimu', 'neon_imu', 'imu']) or
+                    if (_is_declared_imu_stream(stream) or
                         (name.lower() in ['neonfixations', 'neon_fixations', 'fixations']) or
                         (name.lower() in ['neonsaccades', 'neon_saccades', 'saccades'])):
                         continue
@@ -1486,7 +1634,11 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
                         # IMU typically has 9-13 channels (gyro xyz, accel xyz, quaternion wxyz, optional euler angles)
                         print(f"Stream '{name}' looks like it might contain IMU data (has {channel_count} channels)")
                         if input("Extract as IMU data? (y/n): ").lower().startswith('y'):
-                            extract_imu_stream(stream, output_dir)
+                            output_path = extract_imu_stream(stream, output_dir)
+                            if output_path is not None:
+                                imu_outputs.append(
+                                    (name, os.path.basename(output_path))
+                                )
                             found_imu = True
                             continue
                     
@@ -1532,7 +1684,28 @@ def extract_streams(xdf_file, output_dir, keep_raw_depth=True, depth_interval=30
         
         # Print summary of specialized streams
         print("\nSpecialized streams extraction summary:")
-        print(f"- IMU data: {'Extracted' if found_imu else 'Not found'}")
+        if imu_outputs:
+            imu_summary = ", ".join(
+                f"{stream_name} -> {filename}"
+                for stream_name, filename in imu_outputs
+            )
+            print(f"- IMU data: {len(imu_outputs)} stream(s) extracted: {imu_summary}")
+        elif found_imu:
+            print("- IMU data: Found, but no CSV was produced")
+        else:
+            print("- IMU data: Not found")
+        if depth_outputs:
+            depth_summary = ", ".join(
+                f"{result['stream_name']} "
+                f"({result['depth_scale_m_per_unit']!r} m/unit)"
+                for result in depth_outputs
+            )
+            print(
+                f"- Depth data: {len(depth_outputs)} stream(s) extracted: "
+                f"{depth_summary}"
+            )
+        else:
+            print("- Depth data: Not found or not safely extractable")
         print(f"- Fixations data: {'Extracted' if found_fixations else 'Not found'}")
         print(f"- Saccades data: {'Extracted' if found_saccades else 'Not found'}")
         

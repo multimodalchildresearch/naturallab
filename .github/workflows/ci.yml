@@ -48,7 +48,7 @@ jobs:
         run: |
           python -m pip install dist/*.whl
           cd /tmp
-          python -c "from importlib.resources import files; import naturallab; print(naturallab.__file__); assert (files('naturallab.config.presets') / 'qwen36_27b_quality.yaml').is_file(); assert (files('naturallab.acquisition.config') / 'default_config.json').is_file()"
+          python -c "from importlib.resources import files; import naturallab; print(naturallab.__file__); assert (files('naturallab.config.presets') / 'qwen36_27b_quality.yaml').is_file()"
           naturallab --version
           naturallab doctor --profile core
 

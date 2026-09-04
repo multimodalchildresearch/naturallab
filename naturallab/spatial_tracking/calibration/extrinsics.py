@@ -1893,9 +1893,9 @@ def calibrate_extrinsics_from_manifest(
         "volumetric_validated": False,
         "supported_now": [
             "shared-floor cross-view registration and fusion",
-            "provisional multi-view triangulation with explicit uncertainty",
         ],
         "not_yet_demonstrated": [
+            "general-purpose multi-view point or skeleton triangulation",
             "volumetric 3D accuracy away from the floor plane",
             "dynamic inter-camera synchronization",
         ],

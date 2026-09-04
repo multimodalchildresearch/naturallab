@@ -62,16 +62,14 @@ tracking = [
 gaze = [
   "h5py>=3.0.0",
   "matplotlib>=3.3.0",
-  "pycocotools>=2.0.6",
   "torch>=1.13.0",
-  "torchmetrics>=1.0.0",
   "torchvision>=0.14.0",
   "transformers>=4.46.0",
 ]
 acquisition = [
-  "av>=10.0.0",
+  "av>=14.2.0",
   "pylsl>=1.16.0",
-  "pupil-labs-realtime-api>=1.0.0",
+  "pupil-labs-realtime-api>=1.7.1",
   "pyxdf>=1.16.0",
   "scipy>=1.5.0",
   "soundfile>=0.12.0",
@@ -82,19 +80,17 @@ qwen = [
   "torch>=1.13.0",
 ]
 all = [
-  "av>=10.0.0",
+  "av>=14.2.0",
   "filterpy>=1.4.5",
   "h5py>=3.0.0",
   "matplotlib>=3.3.0",
   "mediapipe>=0.10.0",
-  "pycocotools>=2.0.6",
   "pylsl>=1.16.0",
-  "pupil-labs-realtime-api>=1.0.0",
+  "pupil-labs-realtime-api>=1.7.1",
   "pyxdf>=1.16.0",
   "scipy>=1.5.0",
   "soundfile>=0.12.0",
   "torch>=1.13.0",
-  "torchmetrics>=1.0.0",
   "torchvision>=0.14.0",
   "transformers>=4.46.0",
   "ultralytics>=8.0.0",
@@ -113,7 +109,6 @@ naturallab = "naturallab.cli:main"
 include = ["naturallab*"]
 
 [tool.setuptools.package-data]
-"naturallab.acquisition.config" = ["*.json"]
 "naturallab.config.presets" = ["*.yaml"]
 
 [tool.pytest.ini_options]

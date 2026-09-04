@@ -35,7 +35,7 @@ needed by the intended command:
 ```bash
 python -m pip install -e ".[spatial]"      # local tracking and pose tools
 python -m pip install -e ".[gaze]"         # object and gaze analysis
-python -m pip install -e ".[acquisition]"  # LSL, XDF, Neon, and PyAV
+python -m pip install -e ".[acquisition]"  # LSL, XDF, and timestamped Neon streams
 python -m pip install -e ".[qwen]"         # Qwen client + DeepSORT/OSNet
 python -m pip install -e ".[all]"          # all packaged extras
 ```
@@ -81,6 +81,10 @@ offline or frozen analysis, pre-stage the exact file and pass its path with
 - `track_statistics.csv` contains per-track summaries;
 - `run_metadata.json` records the detector and processing provenance; and
 - annotated frames are written when `--save-frames` is selected.
+
+NaturalLab refuses to reuse a non-empty per-video result directory. Pass
+`--overwrite` only to replace that video's complete result set, including old
+CSV files, identities, and annotated frames.
 
 Supplying no calibration produces image-space tracking only. For floor
 coordinates, first complete and independently verify the camera calibration,

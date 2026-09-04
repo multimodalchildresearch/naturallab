@@ -199,6 +199,16 @@ network. Then verify the camera in its own viewer again.
 
 Repeat this test after enabling each additional camera or sensor. Do not begin
 with all devices at once; adding them one at a time makes failures easy to find.
+When Neon audio is enabled, startup succeeds only after the recorder has read a
+source-timestamped audio frame, confirmed its real sample rate and channel
+count, and measured the Neon-to-PC clock offset with Pupil Labs Time Echo.
+Confirm that the matching `NeonAudio_<role>` counter advances in LabRecorder.
+If audio validation fails, fix the source or deliberately select **Disable
+Audio**; do not treat the partial sensor set as a complete recording. A missing
+frame or timestamp gap stops acquisition instead of being hidden. For studies
+that need precise timing, keep the shared visible sync events in the acceptance
+recording because the startup clock estimate does not measure drift throughout
+the session.
 
 ## 7. Make the full acceptance recording
 
@@ -225,6 +235,9 @@ python -m naturallab.acquisition.xdf_extract \
   --depth-interval 1
 ```
 
+The output folder must be new or empty. NaturalLab refuses a non-empty folder
+so files from an earlier extraction cannot be mistaken for current results.
+
 Use the exact XDF path shown in LabRecorder. With the configuration created by
 the NaturalLab window, the usual pattern below the selected recording folder
 is `exp<number>/block_<name>.xdf`; the command above is an example for
@@ -232,6 +245,12 @@ experiment 1 and the **Acceptance** block.
 
 Open every extracted video. Check that the expected view is present for the
 full recording and that playback, duration, and frame count look plausible.
+With one IMU stream, the export is `imu.csv`; with multiple Neon devices, each
+role receives a separate file such as `imu_neonimu_child.csv`. For RealSense,
+keep the generated `<stream>_depth_metadata.json` beside the raw depth images:
+it records the hardware scale needed to convert device values into metres.
+Extraction stops instead of guessing when that scale is missing or conflicts
+with the recorded metadata.
 
 ## 8. Calibrate each fixed room camera automatically
 

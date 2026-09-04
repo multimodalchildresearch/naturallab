@@ -32,6 +32,7 @@ from dataclasses import replace
 import json
 import math
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -53,13 +54,44 @@ VIDEO_SUFFIXES = frozenset(
     }
 )
 
+TRACK_OUTPUT_COLUMNS = (
+    "frame",
+    "track_id",
+    "x1",
+    "y1",
+    "x2",
+    "y2",
+    "confidence",
+    "is_prediction",
+    "timestamp_seconds",
+    "timestamp_ns",
+    "timestamp_source",
+)
+FLOOR_OUTPUT_COLUMNS = ("floor_x", "floor_y", "floor_z")
+STATISTICS_OUTPUT_COLUMNS = (
+    "track_id",
+    "first_frame",
+    "last_frame",
+    "track_records",
+    "observed_frames",
+    "predicted_frames",
+    "span_frames",
+    "covered_frame_count",
+    "duration_seconds",
+    "timing_basis",
+)
+
 
 def discover_video_files(input_path):
     """Return one input file or naturally ordered supported directory videos."""
     from naturallab.media import natural_path_sort_key
 
     if input_path.is_file():
-        return [input_path]
+        return (
+            [input_path]
+            if input_path.suffix.lower() in VIDEO_SUFFIXES
+            else []
+        )
     return sorted(
         (
             path
@@ -68,6 +100,179 @@ def discover_video_files(input_path):
         ),
         key=natural_path_sort_key,
     )
+
+
+def build_video_output_plan(videos, output_path):
+    """Map videos to unambiguous per-video output directories."""
+
+    plan = []
+    destinations = {}
+    for video_path in videos:
+        destination = output_path / video_path.stem
+        destination_key = destination.name.casefold()
+        conflicting_video = destinations.get(destination_key)
+        if conflicting_video is not None:
+            raise ValueError(
+                "input videos map to the same output directory: "
+                f"{conflicting_video.name} and {video_path.name} -> "
+                f"{destination.name}"
+            )
+        destinations[destination_key] = video_path
+        plan.append((video_path, destination))
+    return plan
+
+
+def validate_video_output_plan(plan, *, overwrite):
+    """Fail before processing when a destination could retain old results."""
+
+    for _, destination in plan:
+        if destination.is_symlink():
+            raise FileExistsError(
+                f"refusing symlink output directory: {destination}"
+            )
+        if not destination.exists():
+            continue
+        if not destination.is_dir():
+            raise FileExistsError(
+                f"output destination is not a directory; refusing to replace: "
+                f"{destination}"
+            )
+        is_nonempty_directory = (
+            destination.is_dir() and next(destination.iterdir(), None) is not None
+        )
+        if is_nonempty_directory and not overwrite:
+            raise FileExistsError(
+                f"output already contains results: {destination}; "
+                "pass --overwrite to replace that video's complete output"
+            )
+
+
+def prepare_video_output(destination, *, overwrite):
+    """Create one clean output directory after preflight has succeeded."""
+
+    if destination.is_symlink():
+        raise FileExistsError(
+            f"refusing symlink output directory: {destination}"
+        )
+    if destination.exists():
+        if not destination.is_dir():
+            raise FileExistsError(
+                f"output destination is not a directory; refusing to replace: "
+                f"{destination}"
+            )
+        is_nonempty_directory = (
+            destination.is_dir() and next(destination.iterdir(), None) is not None
+        )
+        if is_nonempty_directory:
+            if not overwrite:
+                raise FileExistsError(
+                    f"output already contains results: {destination}; "
+                    "pass --overwrite to replace it"
+                )
+            shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+
+
+def probe_video(video_path):
+    """Return nominal metadata only when at least one frame can be decoded."""
+
+    import cv2
+
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            return None
+        reported_total_frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        total_frames = (
+            int(reported_total_frames)
+            if math.isfinite(reported_total_frames)
+            and reported_total_frames > 0
+            else 0
+        )
+        if total_frames == 0:
+            return None
+        reported_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        fps = (
+            reported_fps
+            if math.isfinite(reported_fps) and reported_fps > 0
+            else 0.0
+        )
+        decoded, frame = capture.read()
+        if not decoded or frame is None or frame.size == 0:
+            return None
+        return total_frames, fps
+    finally:
+        capture.release()
+
+
+def expected_decoded_frame_count(total_frames, max_frames):
+    """Return the minimum decoded-frame count promised by container metadata."""
+
+    if total_frames <= 0:
+        return None
+    if max_frames is None:
+        return total_frames
+    return min(total_frames, max_frames)
+
+
+def write_track_tables(video_output, all_tracks, *, fps, floor_tracker):
+    """Write stable CSV schemas, including for a valid zero-track run."""
+
+    import pandas as pd
+
+    track_columns = list(TRACK_OUTPUT_COLUMNS)
+    if floor_tracker is not None:
+        track_columns.extend(FLOOR_OUTPUT_COLUMNS)
+    dataframe = pd.DataFrame(all_tracks)
+    if dataframe.empty:
+        dataframe = pd.DataFrame(columns=track_columns)
+    else:
+        ordered_columns = [
+            column for column in track_columns if column in dataframe.columns
+        ]
+        ordered_columns.extend(
+            column
+            for column in dataframe.columns
+            if column not in ordered_columns
+        )
+        dataframe = dataframe.loc[:, ordered_columns]
+    dataframe.to_csv(video_output / "tracks.csv", index=False)
+
+    statistics = []
+    if not dataframe.empty:
+        for track_id in dataframe["track_id"].unique():
+            track_dataframe = dataframe[dataframe["track_id"] == track_id]
+            statistic = summarize_track_records(
+                track_id,
+                track_dataframe,
+                fps,
+            )
+
+            # Use the floor tracker's filtered accumulator so an explicit
+            # legacy correction factor is reflected in the export.
+            if (
+                floor_tracker is not None
+                and "floor_x" in track_dataframe.columns
+                and track_dataframe["floor_x"].notna().any()
+            ):
+                distance = floor_tracker.get_distance(track_id)
+                add_distance_statistics(
+                    statistic,
+                    distance,
+                    floor_tracker.units,
+                )
+            statistics.append(statistic)
+
+    statistics_dataframe = pd.DataFrame(statistics)
+    if statistics_dataframe.empty:
+        statistics_dataframe = pd.DataFrame(
+            columns=STATISTICS_OUTPUT_COLUMNS
+        )
+    statistics_dataframe.to_csv(
+        video_output / "track_statistics.csv",
+        index=False,
+    )
+    return dataframe, statistics_dataframe
 
 
 def load_floor_tracker(camera_calib_path, floor_calib_path, correction_factor=1.0):
@@ -384,6 +589,14 @@ def build_argument_parser():
                        help="Input video file or directory of videos")
     parser.add_argument("--output", "-o", required=True,
                        help="Output directory for results")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=(
+            "Replace complete per-video result directories. Without this "
+            "flag, existing non-empty results make the command fail."
+        ),
+    )
     
     # Detection settings
     parser.add_argument(
@@ -628,10 +841,12 @@ def main(argv=None):
     if not input_path.exists():
         print(f"Error: Input not found: {args.input}")
         return 1
-    
+
     output_path = Path(args.output)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
+    if output_path.exists() and not output_path.is_dir():
+        print(f"Error: Output path is not a directory: {output_path}")
+        return 1
+
     # Load identity descriptions if provided
     identities = None
     if args.identities:
@@ -671,20 +886,60 @@ def main(argv=None):
         print(f"Identities: {list(identities.keys())}")
     print()
     
-    # Import tracking modules
+    # Resolve and validate the complete batch before creating output or
+    # loading models. A directory with no supported videos is an error, not a
+    # successful no-op.
+    videos = discover_video_files(input_path)
+    if not videos:
+        print(
+            "Error: No supported video files found. Supported extensions: "
+            + ", ".join(sorted(VIDEO_SUFFIXES))
+        )
+        return 1
+    try:
+        output_plan = build_video_output_plan(videos, output_path)
+        validate_video_output_plan(
+            output_plan,
+            overwrite=args.overwrite,
+        )
+    except (FileExistsError, ValueError) as error:
+        print(f"Error: {error}")
+        return 1
+
+    video_metadata = {}
+    unusable_videos = []
+    for video_path in videos:
+        metadata = probe_video(video_path)
+        if metadata is None:
+            unusable_videos.append(video_path)
+        else:
+            video_metadata[video_path] = metadata
+    if unusable_videos:
+        print(
+            "Error: Could not establish a complete, decodable video "
+            "contract for:"
+        )
+        for video_path in unusable_videos:
+            print(f"  - {video_path}")
+        print(
+            "Each file must open, report a positive frame count, and decode "
+            "its first frame."
+        )
+        print("No videos were processed and no result directories were changed.")
+        return 1
+
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Import tracking modules only after input and output preflight succeeds.
     try:
         from naturallab.spatial_tracking.tracking.kalman_tracker import (
             KalmanPersonTracker,
         )
-        
-    except ImportError as e:
-        print(f"Error importing modules: {e}")
+    except ImportError as error:
+        print(f"Error importing modules: {error}")
         print("Make sure naturallab is installed: pip install -e .")
         return 1
-    
-    # Process videos
-    videos = discover_video_files(input_path)
-    
+
     print(f"Found {len(videos)} video(s) to process")
 
     qwen_config = None
@@ -698,14 +953,10 @@ def main(argv=None):
             detection_cadence_frames=effective_detection_cadence
         )
     
-    for video_path in videos:
+    for video_path, video_output in output_plan:
         print(f"\nProcessing: {video_path.name}")
         print("-" * 40)
-        
-        # Create output subdirectory for this video
-        video_output = output_path / video_path.stem
-        video_output.mkdir(exist_ok=True)
-        
+
         # Initialize detector
         detector_device = None if args.device == "auto" else args.device
         if args.detector == "yolo":
@@ -793,36 +1044,29 @@ def main(argv=None):
                 correction_factor=args.correction_factor
             )
         
-        # Probe metadata for progress reporting; actual decoding goes through
-        # the common FrameSource contract so container timestamps are retained.
+        # Actual decoding goes through the common FrameSource contract so
+        # container timestamps are retained. Preflight already proved that at
+        # least one frame is decodable.
         import cv2
         from naturallab.media import VideoFileSource
 
-        cap = cv2.VideoCapture(str(video_path))
-        
-        if not cap.isOpened():
-            print("  Error: Could not open video")
-            continue
-        
-        reported_total_frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        total_frames = (
-            int(reported_total_frames)
-            if math.isfinite(reported_total_frames)
-            and reported_total_frames > 0
-            else 0
-        )
-        reported_fps = float(cap.get(cv2.CAP_PROP_FPS))
-        fps = (
-            reported_fps
-            if math.isfinite(reported_fps) and reported_fps > 0
-            else 0.0
-        )
-        cap.release()
-        
+        total_frames, fps = video_metadata[video_path]
         print(
             f"  Total frames: {total_frames if total_frames else 'unknown'}"
         )
         print(f"  Nominal FPS: {fps if fps else 'unknown'}")
+
+        # Start from a clean directory only after all input/model/calibration
+        # setup for this video has succeeded. This removes prior frames and
+        # identity results as well as CSVs when --overwrite is explicit.
+        try:
+            prepare_video_output(
+                video_output,
+                overwrite=args.overwrite,
+            )
+        except FileExistsError as error:
+            print(f"Error: {error}")
+            return 1
         
         # Storage for results
         all_tracks = []
@@ -918,6 +1162,29 @@ def main(argv=None):
             
             frames_processed += 1
 
+        required_frame_count = expected_decoded_frame_count(
+            total_frames,
+            args.max_frames,
+        )
+        if frames_processed == 0:
+            shutil.rmtree(video_output)
+            print(
+                "  Error: Video produced no decodable frames; no result "
+                "directory was kept."
+            )
+            return 1
+        if (
+            required_frame_count is not None
+            and frames_processed < required_frame_count
+        ):
+            shutil.rmtree(video_output)
+            print(
+                "  Error: Video decoding ended early after "
+                f"{frames_processed} of {required_frame_count} expected "
+                "frames; no result directory was kept."
+            )
+            return 1
+
         detector_settings = {
             "confidence_threshold": args.confidence,
             "device": args.device,
@@ -950,46 +1217,22 @@ def main(argv=None):
                 sort_keys=True,
             )
         
-        # Save results
-        import pandas as pd
-        
-        if all_tracks:
-            df = pd.DataFrame(all_tracks)
-            df.to_csv(video_output / "tracks.csv", index=False)
-            print(f"  Saved {len(df)} track records to tracks.csv")
-            
-            # Compute statistics per track
-            stats = []
-            for track_id in df["track_id"].unique():
-                track_df = df[df["track_id"] == track_id]
-                stat = summarize_track_records(
-                    track_id,
-                    track_df,
-                    fps,
-                )
-                
-                # Use the floor tracker's filtered accumulator so an explicit
-                # legacy correction factor is reflected in the export.
-                if (
-                    floor_tracker
-                    and "floor_x" in track_df.columns
-                    and track_df["floor_x"].notna().any()
-                ):
-                    distance = floor_tracker.get_distance(track_id)
-                    add_distance_statistics(
-                        stat,
-                        distance,
-                        floor_tracker.units,
-                    )
-                
-                stats.append(stat)
-            
-            stats_df = pd.DataFrame(stats)
-            stats_df.to_csv(video_output / "track_statistics.csv", index=False)
-            print(f"  Saved statistics for {len(stats_df)} tracks")
-            
-            # Identity matching if requested
-            if identities:
+        # Always write the two table contracts, including headers for a valid
+        # run that found no publishable tracks.
+        df, stats_df = write_track_tables(
+            video_output,
+            all_tracks,
+            fps=fps,
+            floor_tracker=floor_tracker,
+        )
+        print(f"  Saved {len(df)} track records to tracks.csv")
+        print(f"  Saved statistics for {len(stats_df)} tracks")
+
+        # Identity matching if requested. An empty valid run still receives a
+        # deterministic identity file with an empty assignments mapping.
+        if identities:
+            assignments = {}
+            if not df.empty:
                 print("  Performing Qwen role assignment...")
                 from naturallab.spatial_tracking.vlm import (
                     QwenTrackRoleAssigner,
@@ -1009,7 +1252,6 @@ def main(argv=None):
                     ),
                     config=qwen_config,
                 )
-                assignments = {}
                 for track_id in map(str, df["track_id"].unique()):
                     evidence = evidence_by_track.get(track_id, [])
                     if not evidence:
@@ -1027,24 +1269,24 @@ def main(argv=None):
                         assignment
                     )
 
-                with open(
-                    video_output / "identity_matches.json",
-                    "w",
-                    encoding="utf-8",
-                ) as handle:
-                    json.dump(
-                        {
-                            "role_descriptions": identities,
-                            "evidence_images_per_track": (
-                                args.identity_evidence_frames
-                            ),
-                            "assignments": assignments,
-                        },
-                        handle,
-                        indent=2,
-                        sort_keys=True,
-                    )
-                print("  Identity matches saved")
+            with open(
+                video_output / "identity_matches.json",
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                json.dump(
+                    {
+                        "role_descriptions": identities,
+                        "evidence_images_per_track": (
+                            args.identity_evidence_frames
+                        ),
+                        "assignments": assignments,
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+            print("  Identity matches saved")
         
         print(f"  Results saved to: {video_output}")
     

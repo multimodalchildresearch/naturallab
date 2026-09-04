@@ -743,8 +743,11 @@ class DeepSORTTracker(BaseTracker):
                     if self.tracks[track_idx]['id'] in self.track_history:
                         self.track_history[self.tracks[track_idx]['id']]['feature_count'] += 1
         
-        # Mark unmatched tracks as temporarily lost
-        # Apply different logic based on track's history and confidence
+        # Mark unmatched tracks as temporarily lost. Active and lost tracks
+        # are deliberately kept as disjoint collections: a track must never
+        # be predicted or aged through both paths on the same frame.
+        moved_to_lost_ids = set()
+        lost_ids = {track['id'] for track in self.lost_tracks}
         for track_idx in unmatched_tracks:
             track = self.tracks[track_idx]
             track_id = track['id']
@@ -773,11 +776,21 @@ class DeepSORTTracker(BaseTracker):
             if move_to_lost:
                 if self.diagnostics is not None:
                     self.diagnostics.log_track_lost(track_id, frame_idx)
-                self.lost_tracks.append(track)
-        
-        # Remove lost tracks from active tracks
-        self.tracks = [t for t in self.tracks if t['time_since_update'] <= 5 or 
-                       (self._get_track_confidence(t['id']) > 0.8 and t['time_since_update'] <= 8)]
+                if track_id not in lost_ids:
+                    self.lost_tracks.append(track)
+                    lost_ids.add(track_id)
+                moved_to_lost_ids.add(track_id)
+
+        # Move, rather than copy, tracks into the lost pool. The previous
+        # age-based filter could leave the same dictionary in both lists and
+        # append it again on later frames, causing duplicate prediction and
+        # multiple age increments per frame.
+        if moved_to_lost_ids:
+            self.tracks = [
+                track
+                for track in self.tracks
+                if track['id'] not in moved_to_lost_ids
+            ]
         
         # Create new tracks for unmatched detections
         # But be more cautious about creating new tracks when we already have tracks
@@ -842,7 +855,14 @@ class DeepSORTTracker(BaseTracker):
                     if features is not None:
                         # Look for matching ID in gallery (for tracks that might have been removed)
                         matching_id = self.feature_gallery.find_matching_id(features)
-                        if matching_id is not None:
+                        occupied_ids = {
+                            track['id']
+                            for track in (*self.tracks, *self.lost_tracks)
+                        }
+                        if (
+                            matching_id is not None
+                            and matching_id not in occupied_ids
+                        ):
                             # Log the ID reassignment
                             if self.diagnostics is not None:
                                 self.diagnostics.log(

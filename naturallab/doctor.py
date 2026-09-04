@@ -61,8 +61,6 @@ MODULES: Dict[str, Tuple[ModuleRequirement, ...]] = {
         ModuleRequirement("transformers", "transformers", "object detection"),
         ModuleRequirement("h5py", "h5py", "prototype storage"),
         ModuleRequirement("matplotlib", "matplotlib", "diagnostic plots"),
-        ModuleRequirement("pycocotools", "pycocotools", "COCO evaluation"),
-        ModuleRequirement("torchmetrics", "torchmetrics", "model evaluation"),
     ),
     "acquisition": (
         ModuleRequirement("av", "av", "audio/video stream decoding"),

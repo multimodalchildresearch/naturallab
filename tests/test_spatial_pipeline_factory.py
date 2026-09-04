@@ -535,3 +535,50 @@ def test_deepsort_accepts_new_qwen_detection_with_nullable_confidence() -> None:
 
     assert len(output["tracks"]) == 2
     assert {track["score"] for track in output["tracks"]} == {None}
+
+
+def test_deepsort_moves_a_track_to_lost_state_exactly_once() -> None:
+    tracker = DeepSORTTracker(
+        min_hits=1,
+        allow_reid_fallback=False,
+        feature_extractor=FakeFeatureExtractor(),
+        feature_gallery=FakeFeatureGallery(),
+        enable_diagnostics=False,
+    )
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    observed = tracker.process(
+        {
+            "frame": frame,
+            "detections": [[5.0, 5.0, 25.0, 45.0, 0.9]],
+            "detection_metadata": {"skipped": False},
+        }
+    )
+    track_id = observed["tracks"][0]["id"]
+
+    for _ in range(3):
+        tracker.process(
+            {
+                "frame": frame,
+                "detections": [],
+                "detection_metadata": {"skipped": False},
+            }
+        )
+
+    assert tracker.tracks == []
+    assert len(tracker.lost_tracks) == 1
+    lost_track = tracker.lost_tracks[0]
+    assert lost_track["id"] == track_id
+    assert lost_track["time_since_update"] == 3
+
+    tracker.process(
+        {
+            "frame": frame,
+            "detections": [],
+            "detection_metadata": {"skipped": False},
+        }
+    )
+
+    assert tracker.tracks == []
+    assert len(tracker.lost_tracks) == 1
+    assert tracker.lost_tracks[0] is lost_track
+    assert lost_track["time_since_update"] == 4

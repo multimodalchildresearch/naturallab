@@ -17,14 +17,13 @@ Usage:
     python lsl_streams.py
 """
 
-import os
 import sys
 import time
 import base64
 import argparse
 import threading
-import subprocess
-import queue
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 
@@ -34,21 +33,13 @@ running = True
 REALSENSE_FRAME_WIDTH = 640
 REALSENSE_FRAME_HEIGHT = 480
 REALSENSE_FPS = 15
+AUDIO_READ_TIMEOUT_SECONDS = 5.0
+AUDIO_TIME_ECHO_MEASUREMENTS = 100
 
 try:
     import pylsl
 except ImportError:
     pylsl = None
-
-# Try to import PyAV for better audio streaming
-try:
-    import av
-    PYAV_AVAILABLE = True
-    print("PyAV library is available.")
-except ImportError:
-    PYAV_AVAILABLE = False
-    print("PyAV library is not available. Install with: pip install av")
-    print("Falling back to VLC for audio streaming.")
 
 # Check if RealSense is available
 try:
@@ -69,38 +60,6 @@ try:
 except ImportError:
     print("Pupil Labs realtime API is not available. Install with: pip install pupil-labs-realtime-api")
 
-def find_vlc_path():
-    """Find the path to VLC executable"""
-    # Common paths for VLC
-    vlc_paths = [
-        r"C:\Program Files\VideoLAN\VLC\vlc.exe",
-        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"
-    ]
-    
-    # First check common paths
-    for path in vlc_paths:
-        if os.path.exists(path):
-            return path
-    
-    # Try which/where command
-    try:
-        if os.name == 'nt':  # Windows
-            result = subprocess.run(["where", "vlc"], 
-                                   stdout=subprocess.PIPE, text=True, 
-                                   stderr=subprocess.PIPE)
-            if result.returncode == 0:
-                return result.stdout.strip().split('\n')[0]
-        else:  # Linux/Mac
-            result = subprocess.run(["which", "vlc"], 
-                                   stdout=subprocess.PIPE, text=True,
-                                   stderr=subprocess.PIPE)
-            if result.returncode == 0:
-                return result.stdout.strip()
-    except Exception as e:
-        print(f"Error finding VLC in PATH: {e}")
-    
-    return None
-
 #========================= RealSense to LSL =========================#
 def stream_realsense_to_lsl():
     """Stream RealSense camera data to LSL with focus on raw depth data"""
@@ -120,21 +79,6 @@ def stream_realsense_to_lsl():
         source_id="realsense_color"
     )
     color_outlet = pylsl.StreamOutlet(color_info)
-    
-    depth_info = pylsl.StreamInfo(
-        name="RealSense_Depth",
-        type="Depth",
-        channel_count=1,
-        nominal_srate=REALSENSE_FPS,
-        channel_format="string",  # Base64 encoded PNG containing raw depth values
-        source_id="realsense_depth"
-    )
-    # Add depth stream metadata
-    desc = depth_info.desc()
-    desc.append_child_value("content", "raw_depth")
-    desc.append_child_value("depth_format", "uint16_mm")  # 16-bit millimeter scale
-    
-    depth_outlet = pylsl.StreamOutlet(depth_info)
     
     metadata_info = pylsl.StreamInfo(
         name="RealSense_Metadata",
@@ -176,8 +120,33 @@ def stream_realsense_to_lsl():
         
         # Get depth scale for converting raw values to meters
         depth_sensor = profile.get_device().first_depth_sensor()
-        depth_scale = depth_sensor.get_depth_scale()
-        print(f"Depth scale: {depth_scale}")
+        depth_scale = float(depth_sensor.get_depth_scale())
+        if not np.isfinite(depth_scale) or depth_scale <= 0:
+            raise RuntimeError(
+                "RealSense returned an invalid depth scale; refusing to stream "
+                f"unscaled depth values ({depth_scale!r})"
+            )
+        print(f"Depth scale: {depth_scale} metres per raw device unit")
+
+        # Publish the measured scale with the depth stream itself. The separate
+        # DeviceInfo sample remains for compatibility with existing recordings.
+        depth_info = pylsl.StreamInfo(
+            name="RealSense_Depth",
+            type="Depth",
+            channel_count=1,
+            nominal_srate=REALSENSE_FPS,
+            channel_format="string",  # Base64 PNG containing raw depth values
+            source_id="realsense_depth",
+        )
+        desc = depth_info.desc()
+        desc.append_child_value("content", "raw_depth")
+        desc.append_child_value("depth_format", "uint16_device_units")
+        desc.append_child_value(
+            "depth_scale_m_per_unit",
+            repr(depth_scale),
+        )
+        desc.append_child_value("metric_unit", "metre")
+        depth_outlet = pylsl.StreamOutlet(depth_info)
         
         # Send device metadata to LSL
         import json
@@ -185,7 +154,12 @@ def stream_realsense_to_lsl():
         metadata = {
             "name": device.get_info(rs.camera_info.name),
             "serial": device.get_info(rs.camera_info.serial_number),
-            "depth_scale": depth_scale,  # Important for interpreting raw depth values
+            # Keep the old key for readers of existing NaturalLab recordings and
+            # add an explicit unit-bearing name for new readers.
+            "depth_scale": depth_scale,
+            "depth_scale_m_per_unit": depth_scale,
+            "raw_depth_unit": "device_depth_unit",
+            "metric_unit": "metre",
             "timestamp": metadata_timestamp,
             "timestamp_clock": "pylsl.local_clock",
         }
@@ -750,125 +724,393 @@ def stream_rtsp_to_lsl(rtsp_url, stream_name="Camera"):
         print(f"RTSP streaming stopped for {stream_name}")
 
 #========================= Audio Streaming Functions =========================#
-def stream_audio_to_lsl_pyav(url, stream_name="NeonAudio"):
-    """Stream audio from RTSP to LSL using PyAV (improved method)"""
-    print(f"Starting audio streaming for {stream_name} using PyAV (URL hidden)")
-    
-    # Audio settings - will be updated from the actual stream
-    sample_rate = 8000  # Default, will be updated when connected
-    channels = 1       # Default, will be updated when connected
-    
-    # Create LSL outlet for audio
+@dataclass
+class _PreparedAudioStream:
+    """Resources validated before an audio worker is reported as started."""
+
+    device: object
+    first_audio_frame: object
+    first_samples: np.ndarray
+    outlet: object
+    sample_rate: int
+    channel_count: int
+    device_to_client_offset_seconds: float
+    lsl_minus_unix_seconds: float
+    stream_name: str
+
+
+def _audio_source_timestamp_seconds(audio_frame):
+    """Validate one RTCP-derived timestamp exposed by Pupil Labs."""
+    timestamp = getattr(audio_frame, "timestamp_unix_seconds", None)
+    try:
+        timestamp = float(timestamp)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            "the Pupil Labs audio frame has no absolute source timestamp"
+        ) from error
+    if not np.isfinite(timestamp) or timestamp <= 0:
+        raise RuntimeError(
+            "the Pupil Labs audio frame has an invalid absolute source timestamp"
+        )
+    return timestamp
+
+
+def _audio_sample_rate(frame):
+    """Read and validate the rate actually reported by the decoded source."""
+    candidate = getattr(frame, "sample_rate", None)
+    if candidate is not None and int(candidate) > 0:
+        return int(candidate)
+    raise RuntimeError("the decoded audio source did not report a sample rate")
+
+
+def _layout_channel_count(layout):
+    if layout is None:
+        return None
+    channels = getattr(layout, "channels", None)
+    if channels is not None:
+        try:
+            count = len(channels)
+        except TypeError:
+            count = None
+        if count:
+            return int(count)
+    count = getattr(layout, "nb_channels", None)
+    if count is not None and int(count) > 0:
+        return int(count)
+    return None
+
+
+def _audio_channel_count(frame):
+    """Read and validate the channel count from the decoded frame/codec."""
+    candidate = _layout_channel_count(getattr(frame, "layout", None))
+    if candidate is not None and int(candidate) > 0:
+        return int(candidate)
+    raise RuntimeError("the decoded audio source did not report a channel count")
+
+
+def _normalise_audio_samples(frame, channel_count):
+    """Convert planar or packed PyAV audio into LSL sample-major float32."""
+    samples = np.asarray(frame.to_ndarray())
+    samples_per_channel = int(getattr(frame, "samples", 0) or 0)
+
+    if samples.ndim == 1:
+        if samples.size % channel_count:
+            raise RuntimeError("audio sample buffer is not divisible by its channels")
+        samples = samples.reshape(-1, channel_count)
+    elif samples.ndim == 2:
+        if samples_per_channel and samples.shape == (
+            channel_count,
+            samples_per_channel,
+        ):
+            samples = samples.T
+        elif samples_per_channel and samples.shape == (
+            1,
+            samples_per_channel * channel_count,
+        ):
+            samples = samples.reshape(samples_per_channel, channel_count)
+        elif samples.shape[1] == channel_count:
+            pass
+        elif samples.shape[0] == channel_count:
+            samples = samples.T
+        elif samples.size % channel_count == 0:
+            samples = samples.reshape(-1, channel_count)
+        else:
+            raise RuntimeError("unsupported decoded audio buffer shape")
+    else:
+        raise RuntimeError("unsupported decoded audio buffer dimensions")
+
+    if samples.dtype.kind == "u":
+        midpoint = float(np.iinfo(samples.dtype).max + 1) / 2.0
+        samples = (samples.astype(np.float32) - midpoint) / midpoint
+    elif samples.dtype.kind == "i":
+        scale = float(abs(np.iinfo(samples.dtype).min))
+        samples = samples.astype(np.float32) / scale
+    elif samples.dtype.kind == "f":
+        samples = samples.astype(np.float32, copy=False)
+    else:
+        raise RuntimeError(f"unsupported decoded audio dtype: {samples.dtype}")
+
+    if samples.shape[1] != channel_count or not samples.shape[0]:
+        raise RuntimeError("decoded audio does not match the declared channel count")
+    if not np.all(np.isfinite(samples)):
+        raise RuntimeError("decoded audio contains non-finite samples")
+    return np.ascontiguousarray(samples, dtype=np.float32)
+
+
+def _validated_time_echo(device):
+    """Measure and validate the Neon-to-client clock mapping."""
+    estimate_time_offset = getattr(device, "estimate_time_offset", None)
+    if not callable(estimate_time_offset):
+        raise RuntimeError(
+            "Pupil Labs Time Echo is unavailable; upgrade "
+            "pupil-labs-realtime-api and the Companion app"
+        )
+    estimates = estimate_time_offset(
+        number_of_measurements=AUDIO_TIME_ECHO_MEASUREMENTS
+    )
+    if estimates is None:
+        raise RuntimeError(
+            "Pupil Labs Time Echo did not produce a clock-offset estimate"
+        )
+
+    try:
+        offset_mean_ms = float(estimates.time_offset_ms.mean)
+        offset_std_ms = float(estimates.time_offset_ms.std)
+        roundtrip_mean_ms = float(estimates.roundtrip_duration_ms.mean)
+        roundtrip_std_ms = float(estimates.roundtrip_duration_ms.std)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError("Pupil Labs Time Echo returned invalid statistics") from error
+    statistics = (
+        offset_mean_ms,
+        offset_std_ms,
+        roundtrip_mean_ms,
+        roundtrip_std_ms,
+    )
+    if not all(np.isfinite(value) for value in statistics):
+        raise RuntimeError("Pupil Labs Time Echo returned non-finite statistics")
+    if offset_std_ms < 0 or roundtrip_mean_ms < 0 or roundtrip_std_ms < 0:
+        raise RuntimeError("Pupil Labs Time Echo returned impossible statistics")
+    return statistics
+
+
+def _lsl_unix_clock_offset():
+    """Map client Unix timestamps into pylsl's local-clock domain."""
+    unix_before = time.time()
+    lsl_time = pylsl.local_clock()
+    unix_after = time.time()
+    unix_midpoint = (unix_before + unix_after) / 2.0
+    return lsl_time - unix_midpoint, (unix_after - unix_before) / 2.0
+
+
+def _append_audio_metadata(
+    audio_info,
+    sample_rate,
+    channel_count,
+    *,
+    offset_mean_ms,
+    offset_std_ms,
+    roundtrip_mean_ms,
+    roundtrip_std_ms,
+    clock_anchor_uncertainty_seconds,
+):
+    description = audio_info.desc()
+    description.append_child_value("manufacturer", "Pupil Labs")
+    description.append_child_value(
+        "source_transport",
+        "Pupil Labs Realtime API audio with RTCP absolute timestamps",
+    )
+    description.append_child_value("sample_rate_hz", str(sample_rate))
+    description.append_child_value("channel_count", str(channel_count))
+    description.append_child_value(
+        "timestamp_mapping",
+        "Neon Unix time + Time Echo offset mapped to the LSL local clock; "
+        "chunk timestamp identifies the final sample",
+    )
+    description.append_child_value(
+        "time_echo_measurements",
+        str(AUDIO_TIME_ECHO_MEASUREMENTS),
+    )
+    description.append_child_value(
+        "time_echo_offset_mean_ms",
+        repr(offset_mean_ms),
+    )
+    description.append_child_value(
+        "time_echo_offset_std_ms",
+        repr(offset_std_ms),
+    )
+    description.append_child_value(
+        "time_echo_roundtrip_mean_ms",
+        repr(roundtrip_mean_ms),
+    )
+    description.append_child_value(
+        "time_echo_roundtrip_std_ms",
+        repr(roundtrip_std_ms),
+    )
+    description.append_child_value(
+        "client_clock_anchor_uncertainty_seconds",
+        repr(clock_anchor_uncertainty_seconds),
+    )
+    description.append_child_value(
+        "timestamp_limitation",
+        "Time Echo is measured at startup; within-session clock drift is not "
+        "estimated, so validate high-precision studies with a shared sync event",
+    )
+    description.append_child_value(
+        "dropped_frame_policy",
+        "detect from source-timestamp discontinuity and stop acquisition",
+    )
+    description.append_child_value(
+        "timeline_discontinuity_policy",
+        "stop stream and report an error",
+    )
+
+
+def _receive_audio_frame(device):
+    receive = getattr(device, "receive_audio_frame", None)
+    if not callable(receive):
+        raise RuntimeError(
+            "the installed Pupil Labs realtime API has no timestamped audio "
+            "interface; install pupil-labs-realtime-api>=1.7.1"
+        )
+    audio_frame = receive(timeout_seconds=AUDIO_READ_TIMEOUT_SECONDS)
+    if audio_frame is None:
+        raise RuntimeError("timed out waiting for a Pupil Labs audio frame")
+    return audio_frame
+
+
+def _prepare_audio_stream(device, stream_name):
+    """Validate source timing and format before advertising an LSL outlet."""
+    print(f"Validating timestamped Pupil Labs audio for {stream_name}")
+    (
+        offset_mean_ms,
+        offset_std_ms,
+        roundtrip_mean_ms,
+        roundtrip_std_ms,
+    ) = _validated_time_echo(device)
+    lsl_minus_unix_seconds, clock_anchor_uncertainty = _lsl_unix_clock_offset()
+    first_audio_frame = _receive_audio_frame(device)
+    first_frame = getattr(first_audio_frame, "av_frame", None)
+    if first_frame is None:
+        raise RuntimeError("Pupil Labs audio did not provide a decoded audio frame")
+    _audio_source_timestamp_seconds(first_audio_frame)
+    sample_rate = _audio_sample_rate(first_frame)
+    channel_count = _audio_channel_count(first_frame)
+    first_samples = _normalise_audio_samples(first_frame, channel_count)
+
     audio_info = pylsl.StreamInfo(
         name=stream_name,
         type="Audio",
-        channel_count=channels,
+        channel_count=channel_count,
         nominal_srate=sample_rate,
         channel_format="float32",
-        source_id=f"neon_audio_{stream_name.lower().replace(' ', '_')}"
+        source_id=f"neon_audio_{stream_name.lower().replace(' ', '_')}",
+    )
+    _append_audio_metadata(
+        audio_info,
+        sample_rate,
+        channel_count,
+        offset_mean_ms=offset_mean_ms,
+        offset_std_ms=offset_std_ms,
+        roundtrip_mean_ms=roundtrip_mean_ms,
+        roundtrip_std_ms=roundtrip_std_ms,
+        clock_anchor_uncertainty_seconds=clock_anchor_uncertainty,
     )
     audio_outlet = pylsl.StreamOutlet(audio_info)
-    
-    # Create audio queue for processing
-    audio_queue = queue.Queue(maxsize=100)
-    
-    # Function to process audio frames
-    def process_audio_frames():
-        print("Audio processing thread started")
-        try:
-            while running:
-                try:
-                    # Get audio data from queue
-                    samples = audio_queue.get(block=True, timeout=1.0)
-                    
-                    # Push to LSL
-                    if samples.ndim > 1 and samples.shape[0] == channels:
-                        samples = samples.T
-                    
-                    # Push each sample to LSL
-                    if samples.ndim > 1:
-                        audio_outlet.push_chunk(samples)
-                    else:
-                        for i in range(len(samples)):
-                            audio_outlet.push_sample([samples[i]])
-                        
-                    time.sleep(0.001)
-                    
-                except queue.Empty:
-                    continue
-                    
-        except Exception as e:
-            print(f"Error in audio processing thread: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            print("Audio processing thread ended")
-    
-    # Start the audio processing thread
-    processing_thread = threading.Thread(target=process_audio_frames, daemon=True)
-    processing_thread.start()
-    
-    # Connect to audio stream and capture frames
+
+    audio_format = getattr(getattr(first_frame, "format", None), "name", "unknown")
+    print(
+        f"Validated {stream_name}: format={audio_format}, "
+        f"sample_rate={sample_rate} Hz, channels={channel_count}, "
+        f"Time Echo offset={offset_mean_ms:.3f}±{offset_std_ms:.3f} ms"
+    )
+    return _PreparedAudioStream(
+        device=device,
+        first_audio_frame=first_audio_frame,
+        first_samples=first_samples,
+        outlet=audio_outlet,
+        sample_rate=sample_rate,
+        channel_count=channel_count,
+        device_to_client_offset_seconds=offset_mean_ms / 1000.0,
+        lsl_minus_unix_seconds=lsl_minus_unix_seconds,
+        stream_name=stream_name,
+    )
+
+
+def _push_prepared_audio_stream(prepared):
+    """Push source-timestamped audio and stop on any detected frame loss."""
+    expected_source_start = None
+    frame_count = 0
+    sample_count = 0
+    start_time = time.monotonic()
+    audio_frame = prepared.first_audio_frame
+    samples = prepared.first_samples
+
+    while running:
+        frame = getattr(audio_frame, "av_frame", None)
+        if frame is None:
+            raise RuntimeError("Pupil Labs audio frame is missing decoded data")
+        if not running:
+            break
+        frame_rate = _audio_sample_rate(frame)
+        frame_channels = _audio_channel_count(frame)
+        if frame_rate != prepared.sample_rate:
+            raise RuntimeError(
+                f"audio sample rate changed from {prepared.sample_rate} to {frame_rate}"
+            )
+        if frame_channels != prepared.channel_count:
+            raise RuntimeError(
+                "audio channel count changed from "
+                f"{prepared.channel_count} to {frame_channels}"
+            )
+
+        source_start = _audio_source_timestamp_seconds(audio_frame)
+        if expected_source_start is not None:
+            discontinuity = source_start - expected_source_start
+            tolerance = max(2.0 / prepared.sample_rate, 0.0001)
+            if abs(discontinuity) > tolerance:
+                raise RuntimeError(
+                    "audio source timeline discontinuity detected: "
+                    f"{discontinuity:+.6f} seconds"
+                )
+
+        source_last = source_start + ((samples.shape[0] - 1) / prepared.sample_rate)
+        client_unix_last = (
+            source_last + prepared.device_to_client_offset_seconds
+        )
+        lsl_timestamp = (
+            client_unix_last + prepared.lsl_minus_unix_seconds
+        )
+        prepared.outlet.push_chunk(samples.tolist(), lsl_timestamp)
+
+        expected_source_start = source_start + (
+            samples.shape[0] / prepared.sample_rate
+        )
+        frame_count += 1
+        sample_count += samples.shape[0]
+        if frame_count % 100 == 0:
+            elapsed = time.monotonic() - start_time
+            print(
+                f"{prepared.stream_name}: {sample_count} samples from "
+                f"{frame_count} frames in {elapsed:.1f} seconds"
+            )
+
+        audio_frame = _receive_audio_frame(prepared.device)
+        next_frame = getattr(audio_frame, "av_frame", None)
+        if next_frame is None:
+            raise RuntimeError("Pupil Labs audio frame is missing decoded data")
+        samples = _normalise_audio_samples(next_frame, prepared.channel_count)
+
+
+def _run_prepared_audio_stream(prepared):
     try:
-        # Open the RTSP stream
-        container = av.open(url)
-        
-        # Get the audio stream
-        audio_stream = next(s for s in container.streams if s.type == 'audio')
-        
-        # Update the stream info with actual properties
-        sample_rate = audio_stream.codec_context.sample_rate
-        channels = audio_stream.codec_context.channels
-        
-        print(f"Connected to audio stream: {audio_stream}")
-        print(f"Format: {audio_stream.codec_context.format.name}, "
-              f"Sample rate: {sample_rate}, "
-              f"Channels: {channels}")
-        
-        # Track frames for status updates
-        frame_count = 0
-        start_time = time.monotonic()
-        
-        # Process frames
-        for frame in container.decode(audio_stream):
-            if not running:
-                break
-                
-            # Convert audio samples to numpy array
-            samples = frame.to_ndarray()
-            
-            # Convert to float32 in range [-1.0, 1.0]
-            if samples.dtype == np.uint8:
-                samples = (samples.astype(np.float32) - 128) / 128.0
-            elif samples.dtype == np.int16:
-                samples = samples.astype(np.float32) / 32768.0
-            elif samples.dtype == np.int32:
-                samples = samples.astype(np.float32) / 2147483648.0
-            
-            # Add to queue
-            try:
-                audio_queue.put(samples, block=True, timeout=1.0)
-                
-                frame_count += 1
-                if frame_count % 100 == 0:
-                    elapsed = time.monotonic() - start_time
-                    fps = frame_count / elapsed if elapsed > 0 else 0
-                    qsize = audio_queue.qsize()
-                    print(f"Audio: {frame_count} frames ({fps:.1f} FPS), Queue: {qsize}/{audio_queue.maxsize}")
-                    
-                    if qsize > audio_queue.maxsize * 0.8:
-                        time.sleep(0.01)
-                    
-            except queue.Full:
-                print("Warning: Audio buffer full, dropping frame")
-        
-    except Exception as e:
-        print(f"Error in audio streaming thread: {e}")
-        import traceback
-        traceback.print_exc()
-    
+        _push_prepared_audio_stream(prepared)
+    except Exception as error:
+        print(
+            f"Audio stream {prepared.stream_name} stopped with an error: {error}",
+            file=sys.stderr,
+        )
     finally:
-        print("Audio streaming stopped")
+        print(f"Audio streaming stopped for {prepared.stream_name}")
+
+
+def start_audio_stream_to_lsl(device, stream_name="NeonAudio"):
+    """Validate timestamped Neon audio, then start its publish worker."""
+    prepared = _prepare_audio_stream(device, stream_name)
+    worker = threading.Thread(
+        target=_run_prepared_audio_stream,
+        args=(prepared,),
+        daemon=True,
+        name=f"audio-{stream_name}",
+    )
+    worker.start()
+    return worker
+
+
+def stream_audio_to_lsl(device, stream_name="NeonAudio"):
+    """Validate and stream timestamped Neon audio in the current thread."""
+    prepared = _prepare_audio_stream(device, stream_name)
+    _push_prepared_audio_stream(prepared)
+
 
 #========================= Main Function =========================#
 def main():
@@ -901,8 +1143,6 @@ def main():
     )
     parser.set_defaults(no_eye_events=True)
     parser.add_argument("--no-imu", action="store_true", help="Disable IMU streaming")
-    parser.add_argument("--audio-method", type=str, choices=["pyav", "vlc"], default="pyav", 
-                       help="Method to use for audio streaming (default: pyav)")
     parser.add_argument(
         "--rtsp-urls",
         type=str,
@@ -920,6 +1160,14 @@ def main():
     
     # Store threads
     threads = []
+    audio_workers = []
+    audio_start_failures = []
+    expected_audio_streams = set()
+    if not args.no_neon and not args.no_audio:
+        if args.caregiver_ip:
+            expected_audio_streams.add("NeonAudio_Caregiver")
+        if args.child_ip:
+            expected_audio_streams.add("NeonAudio_Child")
     
     # Start RealSense streaming if enabled
     if not args.no_realsense and REALSENSE_AVAILABLE:
@@ -1031,20 +1279,30 @@ def main():
                     # Start audio streaming if enabled (for both devices with unique names)
                     if not args.no_audio:
                         device_ip = getattr(device, 'phone_ip', getattr(device, 'address', args.caregiver_ip if role == "Caregiver" else args.child_ip))
-                        neon_audio_url = f"rtsp://{device_ip}:8086/?audio=on"
-                        
-                        if args.audio_method == "pyav" and PYAV_AVAILABLE:
-                            audio_thread = threading.Thread(
-                                target=stream_audio_to_lsl_pyav, 
-                                args=(neon_audio_url, f"NeonAudio_{role}")
+                        stream_name = f"NeonAudio_{role}"
+                        expected_audio_streams.add(stream_name)
+                        try:
+                            audio_thread = start_audio_stream_to_lsl(
+                                device,
+                                stream_name,
                             )
-                            audio_thread.daemon = True
-                            audio_thread.start()
-                            threads.append(audio_thread)
-                            print(f"Started audio streaming for {role} at {device_ip}")
+                            if not audio_thread.is_alive():
+                                raise RuntimeError(
+                                    "audio worker stopped during startup"
+                                )
+                        except Exception as error:
+                            audio_start_failures.append((stream_name, str(error)))
+                            print(
+                                f"✗ Audio did not start for {role}: {error}",
+                                file=sys.stderr,
+                            )
                         else:
-                            # VLC fallback would go here if implemented
-                            print("VLC audio streaming not implemented in this version")
+                            threads.append(audio_thread)
+                            audio_workers.append((stream_name, audio_thread))
+                            print(
+                                f"✓ Started validated audio streaming for {role} "
+                                f"at {device_ip}"
+                            )
             else:
                 print("No Neon devices connected. Continuing with other streams...")
                 
@@ -1080,6 +1338,30 @@ def main():
                 rtsp_thread.start()
                 threads.append(rtsp_thread)
 
+    active_audio_names = {
+        stream_name
+        for stream_name, worker in audio_workers
+        if worker.is_alive()
+    }
+    missing_audio_streams = expected_audio_streams - active_audio_names
+    if not args.no_neon and not args.no_audio and not expected_audio_streams:
+        audio_start_failures.append(
+            ("NeonAudio", "no Neon device connected for requested audio")
+        )
+        missing_audio_streams.add("NeonAudio")
+
+    if audio_start_failures or missing_audio_streams:
+        failed_names = ", ".join(sorted(missing_audio_streams))
+        print(
+            "Error: requested Neon audio failed validation for "
+            f"{failed_names}. Fix audio or rerun with --no-audio.",
+            file=sys.stderr,
+        )
+        running = False
+        for thread in threads:
+            thread.join(timeout=2)
+        return 1
+
     if not threads:
         print(
             "Error: no acquisition source started. Enable at least one "
@@ -1103,13 +1385,38 @@ def main():
         if not args.no_eye_events:
             print("  - NeonFixations_Child (validate device role before use)")
             print("  - NeonSaccades_Child (validate device role before use)")
-        if not args.no_audio:
-            print("  - NeonAudio_Caregiver, NeonAudio_Child")
+        active_audio_streams = [
+            stream_name
+            for stream_name, worker in audio_workers
+            if worker.is_alive()
+        ]
+        if active_audio_streams:
+            print(f"  - {', '.join(active_audio_streams)}")
+        elif not args.no_audio:
+            print(
+                "  - Audio was requested but no validated NeonAudio stream is active",
+                file=sys.stderr,
+            )
     print("\nRunning... Press Ctrl+C to stop")
-    
+
+    exit_code = 0
     try:
         # Keep running until interrupted
         while running:
+            failed_audio_streams = [
+                stream_name
+                for stream_name, worker in audio_workers
+                if not worker.is_alive()
+            ]
+            if failed_audio_streams:
+                print(
+                    "Error: audio streaming stopped unexpectedly for "
+                    f"{', '.join(failed_audio_streams)}; stopping acquisition.",
+                    file=sys.stderr,
+                )
+                exit_code = 1
+                running = False
+                break
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping all streams...")
@@ -1120,7 +1427,7 @@ def main():
         thread.join(timeout=2)
 
     print("All streams stopped")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

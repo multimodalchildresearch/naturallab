@@ -278,10 +278,10 @@ artifact. A quality failure writes `candidate-room-registration.yaml` and the
 evidence, then exits with code 3; it does not publish the normal operational
 filename. `PASS` establishes the declared planar geometry. When all targets
 lie on the floor, the report remains
-`volumetric_validated: false`: the result supports shared-floor fusion and
-provisional triangulation but has not certified accuracy at head or hand
-height. Camera motion after the shared recording invalidates that camera's
-transform.
+`volumetric_validated: false`: the result supports shared-floor fusion only.
+It does not provide general-purpose multi-view point or skeleton triangulation
+and has not certified accuracy at head or hand height. Camera motion after the
+shared recording invalidates that camera's transform.
 
 ## Step 4: record and run independent verification
 

@@ -128,9 +128,13 @@ photograph, tuning, visual-review, and external-training workflow.
 ## Multi-Sensor Data Acquisition
 
 Record multiple sensors in one XDF container using Lab Streaming Layer (LSL).
-The adapters use host-arrival timestamps in LSL's local-clock domain. These are
-not camera exposure timestamps, so timing-sensitive studies must measure
-capture offset and drift for their actual hardware and network.
+Camera, gaze, depth, and IMU adapters currently use host-arrival timestamps in
+LSL's local-clock domain. These are not camera exposure timestamps, so
+timing-sensitive studies must measure capture offset and drift for their actual
+hardware and network. Neon audio is different: it uses the Pupil Labs API's
+RTCP-derived source timestamp plus a startup Time Echo clock-offset estimate,
+and stops if it detects a source-timestamp gap. A shared sync event is still
+required to quantify within-session drift for high-precision studies.
 
 ### Quick Start
 
@@ -159,7 +163,7 @@ provenance for the actual devices used.
 ### Why LSL?
 
 - **Common recording container**: LabRecorder stores the LSL streams and their
-  host-side timestamps from LSL's local-clock domain together in one XDF file
+  timestamps from LSL's local-clock domain together in one XDF file
 - **Measured precision only**: Current camera adapters timestamp frames after
   receipt and decoding, not at camera exposure; validate capture offsets and
   clock drift before making cross-device timing claims

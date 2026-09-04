@@ -85,7 +85,7 @@ python -m pip install -e ".[qwen]"  # Qwen + required DeepSORT/OSNet runtime
 python -m pip install -e ".[all,dev]"
 ```
 
-The acquisition extra covers LSL, XDF, Pupil Labs, and PyAV support.
+The acquisition extra covers LSL, XDF, and timestamped Pupil Labs streams.
 Intel RealSense additionally requires a platform-compatible `pyrealsense2`
 installation. NaturalLab commands do not install packages at runtime.
 
@@ -197,6 +197,10 @@ Outputs are written below `results/<video-name>/`:
   detection provenance.
 - `identity_matches.json`: role, abstention, reason, and Qwen provenance when
   role assignment was requested.
+
+The command refuses to reuse a non-empty per-video result directory. Pass
+`--overwrite` only when you intend to replace that video's complete result set,
+including CSV files, role assignments, and saved frames.
 
 ## Calibration and camera views
 

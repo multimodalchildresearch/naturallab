@@ -858,9 +858,32 @@ def test_acquisition_sources_use_lsl_clock_domain_and_monotonic_fps():
 
     for source_path in source_paths:
         source = source_path.read_text(encoding="utf-8")
-        assert "time.time()" not in source, source_path
         assert "pylsl.local_clock()" in source, source_path
         assert "time.monotonic()" in source, source_path
+
+        tree = ast.parse(source)
+        wall_clock_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "time"
+            and node.func.attr == "time"
+        ]
+        if source_path.name == "lsl_streams.py":
+            clock_mapping = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_lsl_unix_clock_offset"
+            )
+            assert all(
+                clock_mapping.lineno <= call.lineno <= clock_mapping.end_lineno
+                for call in wall_clock_calls
+            )
+        else:
+            assert not wall_clock_calls, source_path
 
 
 def test_generated_labrecorder_config_uses_supported_key_value_format(tmp_path):

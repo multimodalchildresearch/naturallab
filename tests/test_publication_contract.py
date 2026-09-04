@@ -26,6 +26,13 @@ PROHIBITED_DOCUMENTATION_PHRASES = (
     "comparable to commercial motion capture systems",
     "100% cross-view tracking accuracy",
     "four-camera volumetric validation passed",
+    "provisional multi-view triangulation",
+)
+
+PROHIBITED_LEGACY_MODULES = (
+    "naturallab/utils/granularity.py",
+    "naturallab/gaze_analysis/object_detection/two_stage.py",
+    "naturallab/spatial_tracking/tracking/track_identity_matching.py",
 )
 
 CLONE_COMMAND_PATTERN = re.compile(
@@ -64,6 +71,29 @@ def test_required_public_docs_and_examples_exist() -> None:
     ]
 
     assert not missing, "Missing public files: " + ", ".join(missing)
+
+
+def test_study_specific_legacy_modules_are_not_shipped() -> None:
+    present = [
+        relative_path
+        for relative_path in PROHIBITED_LEGACY_MODULES
+        if (REPOSITORY_ROOT / relative_path).exists()
+    ]
+
+    assert not present, "Study-specific legacy modules remain: " + ", ".join(
+        present
+    )
+
+
+def test_extrinsics_report_source_does_not_claim_triangulation_support() -> None:
+    source = (
+        REPOSITORY_ROOT
+        / "naturallab/spatial_tracking/calibration/extrinsics.py"
+    ).read_text(encoding="utf-8")
+
+    assert "provisional multi-view triangulation" not in source
+    assert "general-purpose multi-view point or skeleton triangulation" in source
+    assert '"volumetric_validated": False' in source
 
 
 def test_documentation_contains_a_non_anonymous_public_clone_url() -> None:
