@@ -1,0 +1,13 @@
+{
+  "lsl_script_path": "./lsl_streams.py",
+  "conda_env_name": "naturallab",
+  "extraction_drive": "/media",
+  "labrecorder_path": "/usr/bin/LabRecorder",
+  "neon_ip": "",
+  "rtsp_urls": "",
+  "last_recording_dir": "./recordings",
+  "auto_extract": true,
+  "delete_after_extract": false,
+  "depth_interval": 30,
+  "keep_raw_depth": true
+}

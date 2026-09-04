@@ -1,0 +1,3 @@
+# Compatibility entry point for existing development instructions.
+# Package metadata and dependency groups are authoritative in pyproject.toml.
+-e .[all]

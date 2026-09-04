@@ -1,0 +1,61 @@
+name: qwen36_27b_quality
+version: 2
+description: High-quality Qwen3.6-27B grounding and role-assignment workflow.
+
+vlm_service:
+  base_url_env: NATURALLAB_VLM_BASE_URL
+  api_key_env: NATURALLAB_VLM_API_KEY
+  default_base_url: http://127.0.0.1:8000/v1
+  model_id: Qwen/Qwen3.6-27B
+  # The client cannot verify the server's deployment format. Set this only
+  # when the serving configuration is controlled and recorded.
+  precision: unspecified
+  timeout_seconds: 120
+  max_tokens: 1024
+  enable_thinking: false
+
+spatial:
+  detector:
+    backend: qwen_grounding
+    model_id: Qwen/Qwen3.6-27B
+    prompt_version: qwen-person-grounding/v2
+    detection_cadence_frames: 10
+    # Null retains detections for which the VLM does not expose confidence.
+    confidence_threshold: null
+    jpeg_quality: 95
+    adaptive_redetection: false
+
+  tracker:
+    backend: deepsort
+    max_age: 30
+    min_hits: 3
+    iou_threshold: 0.3
+    reid_model:
+      architecture: osnet_ain_x1_0
+      repository: kaiyangzhou/osnet
+      revision: 01af85e82a9db4f3a4f6ed3a72ed9150bd416d04
+      filename: osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth
+      sha256: 8a07e8da38946f7cee37f4561617bf8b6d2fe8f3a4027852893ea092e46d919f
+      size_bytes: 17293009
+      auto_download: true
+    reid_device: cpu
+    reid_threshold: 0.4
+    keep_lost_timeout: 60
+    min_features_for_reid: 5
+    confidence_growth_rate: 0.05
+    enable_diagnostics: false
+    # A fallback must be an explicit per-run decision after a visible warning.
+    allow_reid_fallback: false
+
+  role_assignment:
+    backend: qwen_track_role
+    model_id: Qwen/Qwen3.6-27B
+    prompt_version: qwen-track-role-assignment/v2
+    evidence_images_per_track: 5
+    allow_abstention: true
+    roles:
+      - child
+      - caregiver
+    role_descriptions:
+      child: the infant participant
+      caregiver: the adult caregiver participant

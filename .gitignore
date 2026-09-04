@@ -1,0 +1,72 @@
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Model weights (download separately)
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# Output directories
+output/
+outputs/
+results/
+logs/
+/artifacts/
+/calibration/
+/data/
+/extracted/
+/extracted_data/
+/recordings/
+
+# Data files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.xdf
+*.h5
+*.wav
+*.flac
+*.npy
+*.npz
+*.safetensors
+*.ckpt
+*.cfg
+
+# IDE
+.idea/
+.vscode/
+.cursor/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+.venv
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

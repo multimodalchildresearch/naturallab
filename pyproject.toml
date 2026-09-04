@@ -1,0 +1,126 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "naturallab"
+version = "1.0.0"
+description = "Multi-modal tracking and analysis tools for developmental research"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "NaturalLab contributors" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  "numpy>=1.20.0",
+  "pandas>=1.1.0",
+  "opencv-python>=4.5.0",
+  "Pillow>=10.0.0",
+  "PyYAML>=5.4.0",
+  "tqdm>=4.50.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/multimodalchildresearch/naturallab"
+Repository = "https://github.com/multimodalchildresearch/naturallab"
+Issues = "https://github.com/multimodalchildresearch/naturallab/issues"
+
+[project.optional-dependencies]
+spatial = [
+  "filterpy>=1.4.5",
+  "matplotlib>=3.3.0",
+  "mediapipe>=0.10.0",
+  "scipy>=1.5.0",
+  "torch>=1.13.0",
+  "torchvision>=0.14.0",
+  "transformers>=4.46.0",
+  "ultralytics>=8.0.0",
+]
+tracking = [
+  "filterpy>=1.4.5",
+  "matplotlib>=3.3.0",
+  "mediapipe>=0.10.0",
+  "scipy>=1.5.0",
+  "torch>=1.13.0",
+  "torchvision>=0.14.0",
+  "transformers>=4.46.0",
+  "ultralytics>=8.0.0",
+]
+gaze = [
+  "h5py>=3.0.0",
+  "matplotlib>=3.3.0",
+  "pycocotools>=2.0.6",
+  "torch>=1.13.0",
+  "torchmetrics>=1.0.0",
+  "torchvision>=0.14.0",
+  "transformers>=4.46.0",
+]
+acquisition = [
+  "av>=10.0.0",
+  "pylsl>=1.16.0",
+  "pupil-labs-realtime-api>=1.0.0",
+  "pyxdf>=1.16.0",
+  "scipy>=1.5.0",
+  "soundfile>=0.12.0",
+]
+qwen = [
+  "filterpy>=1.4.5",
+  "scipy>=1.5.0",
+  "torch>=1.13.0",
+]
+all = [
+  "av>=10.0.0",
+  "filterpy>=1.4.5",
+  "h5py>=3.0.0",
+  "matplotlib>=3.3.0",
+  "mediapipe>=0.10.0",
+  "pycocotools>=2.0.6",
+  "pylsl>=1.16.0",
+  "pupil-labs-realtime-api>=1.0.0",
+  "pyxdf>=1.16.0",
+  "scipy>=1.5.0",
+  "soundfile>=0.12.0",
+  "torch>=1.13.0",
+  "torchmetrics>=1.0.0",
+  "torchvision>=0.14.0",
+  "transformers>=4.46.0",
+  "ultralytics>=8.0.0",
+]
+dev = [
+  "build>=1.2.0",
+  "mypy>=1.8.0",
+  "pytest>=7.0.0",
+  "ruff>=0.5.0",
+]
+
+[project.scripts]
+naturallab = "naturallab.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["naturallab*"]
+
+[tool.setuptools.package-data]
+"naturallab.acquisition.config" = ["*.json"]
+"naturallab.config.presets" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

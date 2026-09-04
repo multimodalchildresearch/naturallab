@@ -1,0 +1,111 @@
+# Paths are resolved relative to this file. Replace them with one real session.
+schema_version: "1.0"
+study_id: example-study
+session_id: session-001
+
+views:
+  room_left:
+    media: data/raw/room-left.mp4
+    calibration:
+      intrinsics: data/calibration/room-left/intrinsics.yaml
+      floor_plane: data/calibration/room-left/floor.yaml
+      registration: data/calibration/shared-room/room-registration.yaml
+    metadata:
+      camera_id: ceiling-left-01
+
+  room_right:
+    media: data/raw/room-right.mp4
+    calibration:
+      intrinsics: data/calibration/room-right/intrinsics.yaml
+      floor_plane: data/calibration/room-right/floor.yaml
+      registration: data/calibration/shared-room/room-registration.yaml
+    metadata:
+      camera_id: ceiling-right-02
+
+  wearable:
+    media: data/raw/wearable.mp4
+    gaze_input: data/raw/wearable-gaze.csv
+    object_input: resources/object-prototypes.h5
+    metadata:
+      camera_id: wearable-01
+
+steps:
+  track_people:
+    selected: true
+    depends_on: []
+    inputs: []
+    outputs:
+      - data/derived/tracking
+    config:
+      preset: qwen36_27b_quality
+      model_id: Qwen/Qwen3.6-27B
+      view_ids:
+        - room_left
+        - room_right
+        - wearable
+
+  per_view_metrics:
+    selected: true
+    depends_on:
+      - track_people
+    inputs: []
+    outputs:
+      - data/derived/per-view-metrics.json
+    config:
+      scope: per_view
+      units_from_calibration: true
+
+  # Fusion is opt-in: enable only after assigning cross-view shared identities
+  # and validating every view-to-room registration.
+  shared_room_fusion:
+    selected: false
+    depends_on:
+      - track_people
+    inputs: []
+    outputs:
+      - data/derived/shared-room-trajectories.json
+    config:
+      shared_identity_field: cross_view_identity
+      timestamp_tolerance_ns: 50000000
+
+  detect_objects:
+    selected: true
+    depends_on: []
+    inputs:
+      - resources/object-prototypes.h5
+    outputs:
+      - data/derived/object-detections.json
+    config:
+      view_ids:
+        - wearable
+
+  assign_gaze:
+    selected: true
+    depends_on:
+      - detect_objects
+    inputs: []
+    outputs:
+      - data/derived/gaze-object-assignments.json
+    config:
+      timestamp_tolerance_seconds: 0.05
+      overlap_policy: abstain
+
+  align_multimodal:
+    selected: true
+    depends_on:
+      - track_people
+      - assign_gaze
+    inputs: []
+    outputs:
+      - data/derived/aligned-multimodal.json
+    config:
+      anchor_stream: gaze
+      required_stream_ids:
+        - objects
+      tolerance_seconds:
+        objects: 0.05
+        people: 0.10
+
+metadata:
+  site: example-lab
+  notes: Replace example paths and confirm all time bases before analysis.

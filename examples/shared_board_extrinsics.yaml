@@ -1,0 +1,48 @@
+# Paths are resolved relative to this file. Each camera must remain fixed
+# between this shared-board recording and the study recordings it calibrates.
+schema_version: '1.0'
+kind: shared_board_extrinsics_input
+rig_id: example-room
+anchor_view_id: camera-03
+room_coordinate_frame: rig/example-room/floor/camera-03-x
+room_frame_mode: floor_aligned_anchor
+
+board:
+  # OpenCV internal corners: an 8x8-square board has 7x7 internal corners.
+  internal_columns: 7
+  internal_rows: 7
+  square_size_mm: 30.0
+
+sampling:
+  sample_seconds: 1.0
+  stationary_motion_pixels: 20.0
+  minimum_stationary_samples: 2
+  minimum_placement_separation_pixels: 50.0
+  minimum_shared_placements: 3
+  maximum_shared_placements: 12
+  time_tolerance_seconds: 0.15
+
+quality_limits:
+  maximum_stereo_rms_pixels: 5.0
+  maximum_holdout_p90_pixels: 20.0
+  maximum_transform_p90_rotation_degrees: 1.0
+  maximum_transform_p90_translation_mm: 60.0
+  maximum_floor_normal_angle_degrees: 2.0
+  maximum_floor_offset_mm: 60.0
+  maximum_triangulated_board_p90_error_percent: 5.0
+  minimum_orientation_margin_pixels: 25.0
+
+views:
+  - view_id: camera-01
+    video: ../recordings/camera-01-floor.mp4
+    calibration_bundle: ../calibration/camera-01/calibration-bundle.yaml
+    # Added to frame_index / reported_fps to reach the common time base.
+    time_offset_seconds: 0.0
+  - view_id: camera-02
+    video: ../recordings/camera-02-floor.mp4
+    calibration_bundle: ../calibration/camera-02/calibration-bundle.yaml
+    time_offset_seconds: 0.0
+  - view_id: camera-03
+    video: ../recordings/camera-03-floor.mp4
+    calibration_bundle: ../calibration/camera-03/calibration-bundle.yaml
+    time_offset_seconds: 0.0
